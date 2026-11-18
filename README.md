@@ -98,7 +98,7 @@ Every clip is public:
 | BONES-SEED, G1 retarget | training (10,000 clips) | [bones-studio/seed](https://huggingface.co/datasets/bones-studio/seed) (gated) | [BONES-SEED license](https://bones.studio/info/seed-license) |
 | KungfuAthlete, G1 | training (635 clips), Extreme test (308 clips) | [LuluCao/KungfuAthleteBot](https://huggingface.co/datasets/LuluCao/KungfuAthleteBot), [NPCLEI/KungFuAthleteBot](https://github.com/NPCLEI/KungFuAthleteBot) | Apache-2.0 |
 | Kneeling and crawling, G1 and RP1 | training (56 clips) | ours, in [`assets/motions/kneel_crawl`](assets/motions/kneel_crawl) | MIT (this repository) |
-| XtremeMotion, G1 | training (14 clips) | the curated motion subset of [Perkins729/OmniXtreme](https://github.com/Perkins729/OmniXtreme) | Apache-2.0 |
+| XtremeMotion, G1 | training (14 clips) | the curated motion subset of [Perkins729/OmniXtreme](https://github.com/Perkins729/OmniXtreme) | Apache-2.0 (the repository's license) |
 | MotionDecode | Loco / Mani / Dance / Ground tests (228 clips) | [CMRobot/MotionDecode](https://huggingface.co/datasets/CMRobot/MotionDecode), as packaged by [sim2real](https://github.com/EGalahad/sim2real) | non-commercial access terms |
 
 **G1 library.** `tools/data/build_library.sh g1` builds it from the sources (23.5 GB BONES-SEED download; accept
@@ -299,5 +299,7 @@ Robots: Unitree G1 ([unitree_mujoco](https://github.com/unitreerobotics/unitree_
 ([rp1_description](https://github.com/Roboparty/rp1_description)).
 
 Code: MIT ([LICENSE](LICENSE)). The checkpoints, videos and built motion libraries are derived from the motion
-datasets above and follow their licenses (LAFAN1: CC BY-NC-ND 4.0; BONES-SEED: its own license; MotionDecode:
-non-commercial terms); they are not covered by the MIT License.
+datasets above and follow their licenses (LAFAN1: CC BY-NC-ND 4.0; BONES-SEED: its own license; KungfuAthlete and
+XtremeMotion: Apache-2.0; MotionDecode: non-commercial terms); they are not covered by the MIT License. The kneeling
+and crawling clips in `assets/motions/kneel_crawl` are ours, under the MIT License. Dataset sources and terms:
+[Data](#data) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

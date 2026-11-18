@@ -62,6 +62,24 @@ SOFTWARE.
 
 The Python dependencies (mjlab, MuJoCo, MuJoCo Warp, NVIDIA Warp, PyTorch, matplotlib, Pillow) are installed from
 their own distributions under their own licenses (Apache-2.0, BSD-3-Clause and others) and are not redistributed here.
-Motion data are not redistributed. The LAFAN1 motions (Ubisoft La Forge, CC BY-NC-ND 4.0) and the Unitree G1
-description (BSD-3-Clause) are downloaded by `tools/download_data.sh`; files derived from motion data (the videos in
-`docs/static/videos`, checkpoints) are not covered by this repository's MIT License.
+The Unitree G1 description (BSD-3-Clause) is downloaded by `tools/download_data.sh`.
+
+The only motion clips in this repository are the 56 kneeling and crawling clips in `assets/motions/kneel_crawl` (G1
+and their RP1 retargets). They are ours and released under this repository's MIT License. All other motion data are
+downloaded from their sources by `tools/download_data.sh` and `tools/data/build_library.sh` and are not redistributed:
+
+- LAFAN1 (Ubisoft La Forge), as the G1 retarget of
+  [lvhaidong/LAFAN1_Retargeting_Dataset](https://huggingface.co/datasets/lvhaidong/LAFAN1_Retargeting_Dataset):
+  CC BY-NC-ND 4.0.
+- BONES-SEED ([bones-studio/seed](https://huggingface.co/datasets/bones-studio/seed), gated):
+  [BONES-SEED license](https://bones.studio/info/seed-license).
+- KungfuAthlete ([LuluCao/KungfuAthleteBot](https://huggingface.co/datasets/LuluCao/KungfuAthleteBot),
+  [NPCLEI/KungFuAthleteBot](https://github.com/NPCLEI/KungFuAthleteBot)): Apache-2.0.
+- XtremeMotion, the curated motion subset linked from the README of
+  [Perkins729/OmniXtreme](https://github.com/Perkins729/OmniXtreme): Apache-2.0, the license of that repository (the
+  file carries no separate terms).
+- MotionDecode ([CMRobot/MotionDecode](https://huggingface.co/datasets/CMRobot/MotionDecode), test sets only):
+  non-commercial access terms.
+
+Files derived from these datasets (the videos in `docs/static/videos`, checkpoints, built motion libraries) are not
+covered by this repository's MIT License and follow the licenses of the data they come from.
