@@ -362,7 +362,13 @@ elif args.init:
     ck = torch.load(args.init, map_location=dev, weights_only=False)
     assert "critic" in ck, f"--init {args.init}: no critic (use last.pt)"
     check_pruned(ck.get("args", {}), what=args.init)
-    wm.load_state_dict(ck["wm"]), pi.load_state_dict(ck.get("pi_live", ck["pi"])), critic.load_state_dict(ck["critic"])
+    try:
+        wm.load_state_dict(ck["wm"]), pi.load_state_dict(ck.get("pi_live", ck["pi"])), critic.load_state_dict(ck["critic"])
+    except RuntimeError as e:
+        skip = {"log_dir", "motion_dir", "motion_prior", "init", "resume", "iterations", "seed", "ckpt_every", "ckpt_at"}
+        diff = {k: v for k, v in ck.get("args", {}).items() if k not in skip and k in vars(args) and getattr(args, k) != v}
+        raise SystemExit(f"--init {args.init}: the networks differ from this run's ({str(e).splitlines()[0]}); "
+                         f"options of the checkpoint that differ from this run: {diff}") from e
     pi_l.load_state_dict(ck.get("pi_live", ck["pi"]))
     if pi_avg is not None:
         pi_avg.module.load_state_dict(ck["pi"])

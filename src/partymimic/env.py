@@ -223,9 +223,11 @@ class TrackingSim:
             self.alloc.record_mixed(probs)
         bins = torch.multinomial(probs, n, replacement=True)
         start = m.bin_start[bins]
-        end = torch.minimum(start + 50, m.clip_end[m.bin_clip[bins]])  # keep >= 1 step before the clip end
+        clip_end = m.clip_end[m.bin_clip[bins]]
+        end = torch.minimum(start + 50, clip_end)  # keep >= 1 step before the clip end
         f = start + (torch.rand(n, device=self.device) * (end - start).float()).long()
-        return f, bins
+        # a clip's last bin can hold only its last frame (start == clip_end)
+        return torch.minimum(f, clip_end - 1), bins
 
     def reset(self, env_ids: torch.Tensor, frames: torch.Tensor | None = None):
         if len(env_ids) == 0:
