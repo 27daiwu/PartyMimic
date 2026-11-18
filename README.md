@@ -90,13 +90,15 @@ them (`data/rp1_28dof_mjlab/`), which is the model PartyMimic and the evaluator 
 
 ## Data
 
-Every clip comes from a public dataset:
+Every clip is public:
 
 | Dataset | Used for | Source | License |
 |---|---|---|---|
 | LAFAN1, G1 retarget | training (40 clips) | [lvhaidong/LAFAN1_Retargeting_Dataset](https://huggingface.co/datasets/lvhaidong/LAFAN1_Retargeting_Dataset) ([LAFAN1](https://github.com/ubisoft/ubisoft-laforge-animation-dataset)) | CC BY-NC-ND 4.0 |
 | BONES-SEED, G1 retarget | training (10,000 clips) | [bones-studio/seed](https://huggingface.co/datasets/bones-studio/seed) (gated) | [BONES-SEED license](https://bones.studio/info/seed-license) |
 | KungfuAthlete, G1 | training (635 clips), Extreme test (308 clips) | [LuluCao/KungfuAthleteBot](https://huggingface.co/datasets/LuluCao/KungfuAthleteBot), [NPCLEI/KungFuAthleteBot](https://github.com/NPCLEI/KungFuAthleteBot) | Apache-2.0 |
+| Kneeling and crawling, G1 and RP1 | training (56 clips) | ours, in [`assets/motions/kneel_crawl`](assets/motions/kneel_crawl) | MIT (this repository) |
+| XtremeMotion, G1 | training (14 clips) | the curated motion subset of [Perkins729/OmniXtreme](https://github.com/Perkins729/OmniXtreme) | Apache-2.0 |
 | MotionDecode | Loco / Mani / Dance / Ground tests (228 clips) | [CMRobot/MotionDecode](https://huggingface.co/datasets/CMRobot/MotionDecode), as packaged by [sim2real](https://github.com/EGalahad/sim2real) | non-commercial access terms |
 
 **G1 library.** `tools/data/build_library.sh g1` builds it from the sources (23.5 GB BONES-SEED download; accept
@@ -109,7 +111,10 @@ its terms on Hugging Face and log in with `hf auth login` or set `HF_TOKEN`):
    joint limits, speeds); `write` drops the failing clips, corrects the floor and writes the train split and the
    Extreme test set of [`manifests/kungfu_split.json`](manifests/kungfu_split.json) (a 30% test share per subset and
    style, drawn by whole source videos, so no test clip shares a video with a training clip).
-4. All clips are linked into `data/motions/g1_mix`; the Extreme set is `data/testsets/extreme_g1`.
+4. XtremeMotion: the one 13 MB file of OmniXtreme's curated subset (SHA-256 checked), cut at its static standing
+   frames into 14 clips (`tools/data/xtreme.py`), each once in the library (`xtreme_XX__c1`).
+5. All clips, with the 56 kneeling and crawling clips of `assets/motions/kneel_crawl/g1`, are linked into
+   `data/motions/g1_mix` (10,745 clips); the Extreme set is `data/testsets/extreme_g1`.
 
 The selection of the BONES-SEED subset can be rerun (`feat` needs BONES-SEED's `metadata/seed_metadata_v004.parquet`,
 `select` a GPU) and gives the same list:
@@ -132,7 +137,8 @@ HHT=<human-humanoid-tools checkout> P=8 GPUS="0 1" tools/data/build_library.sh r
 
 It writes the G1 clips as csv (`tools/data/rp1_data.py g1csv`), retargets them (`tools/data/rp1_retarget.sh`: profile
 `mimic`, Newton backend, 24 IK iterations, 50 Hz, the zero-pose calibration and the robot presets of
-[`assets/hhtools_robots`](assets/hhtools_robots)), converts the RP1 csv to npz (`data/motions/rp1_mix`) and moves the
+[`assets/hhtools_robots`](assets/hhtools_robots)), converts the RP1 csv to npz (`data/motions/rp1_mix`), puts in the RP1 copies of the kneeling and crawling clips
+(`assets/motions/kneel_crawl/rp1`, the retargets of the page's library) and moves the
 KungfuAthlete clips to the G1 floor height (`tools/data/rp1_floor.py`; R2R leaves some jump clips 2–5 cm above the
 ground). The Extreme set is retargeted the same way (`data/testsets/extreme_rp1`). R2R takes about 8 s per clip per
 process; `P` processes run in parallel over the GPUs in `GPUS`. The RP1 copy of the MotionDecode tests:
