@@ -61,23 +61,26 @@ on the [project page](https://roboparty.github.io/PartyMimic/#results).</sub>
 
 ## Checkpoints
 
-Two checkpoints, the default recipe (MLP encoder, joint references), seed 0, 12,000 iterations:
+Two checkpoints of the [project-page recipe](#train) (MLP encoder, joint references), seed 0, 12,000 iterations,
+trained with this code; scored as in the results above:
 
-| File | Robot | Training | Loco | Mani | Dance | Ground | Extreme | Mean |
-|---|---|---:|---:|---:|---:|---:|---:|---:|
-| [`checkpoints/g1_mlp.pt`](checkpoints/g1_mlp.pt) | G1 (`--robot g1mj`) | 27 min | 25.5 | 20.6 | 36.7 | 82.6 | 61.9 | 45.5 |
-| [`checkpoints/rp1_mlp.pt`](checkpoints/rp1_mlp.pt) | RP1 (`--robot rp1`) | 29 min | 23.3 | 16.5 | 35.5 | 102.3 | 59.2 | 47.4 |
+| File | Robot | Training | Loco | Mani | Dance | Ground | Extreme | Mean | Extreme success |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| [`checkpoints/g1_mlp.pt`](checkpoints/g1_mlp.pt) | G1 (`--robot g1mj`) | 31 min | 26.4 | 23.2 | 36.8 | 50.9 | 57.7 | 39.0 | 67.9% |
+| [`checkpoints/rp1_mlp.pt`](checkpoints/rp1_mlp.pt) | RP1 (`--robot rp1`) | 31 min | 22.7 | 17.3 | 33.0 | 71.7 | 53.4 | 39.6 | 66.6% |
 
-These checkpoints come from the first release: its default recipe (before the project-page recipe), scored with the
-absolute-heading error, so their numbers are not comparable to the results above.
+<sub>Both trained at the same time on one machine (two RTX 4090s, shared CPU), hence the longer training time.</sub>
 
 Each holds the policy, world model and critic (no optimizer state). Export for the sim2real controller (sim2sim
-and real robot), score, or fine-tune:
+and real robot), score, or fine-tune. Fine-tuning needs the options that shape the networks and the reward of the
+checkpoint's recipe (`--init` lists them when they are missing); the clip allocation is left out for a few clips:
 
 ```bash
 mkdir -p deploy && uv run python tools/export_deploy_onnx.py checkpoints/g1_mlp.pt deploy/g1_mlp.onnx  # + .yaml
 SIM2REAL=<patched sim2real checkout> bash scripts/eval.sh checkpoints/g1_mlp.pt eval/g1_mlp g1    # see Evaluate
-bash scripts/train.sh logs/g1_ft --robot g1mj --motion_dir <a few clips> --init checkpoints/g1_mlp.pt --iterations 2000
+F=(--std_scale 0.35 --obs_err kp --wrist_kernel 0.5 --wrist_payload 2
+   --v_clip 10 --v_clip_raw --wm_guard 5 --v_guard 5 --action_noise 0)
+bash scripts/train.sh logs/g1_ft --robot g1mj --motion_dir <a few clips> --init checkpoints/g1_mlp.pt "${F[@]}" --iterations 2000
 ```
 
 The export checks the ONNX against the PyTorch policy on a few training clips (at least 4). Without the training
@@ -174,7 +177,7 @@ at 22.6 and 23.4 GB. Checkpoints are written every 2,000 iterations (`ckpt_00200
 **Options.**
 
 - Defaults include `--muon_wd 0.1` and `--std_scale 0.6` (see [The recipe](#the-recipe)). The shipped checkpoints
-  were trained with `std_scale 0.35` and no Muon weight decay.
+  were trained with the project-page recipe below (`std_scale 0.35`).
 - `--ref_enc xattn`: the cross-attention reference encoder. Lower error on Dance, Ground and Extreme (tables above)
   for 1.6x the training time. It needs more than 24 GB; on a 24 GB card add `--pi_batch 1024` (G1: 29 min).
 - `--interface sparse5`: the policy gets only the pelvis, head, wrist and ankle poses of the reference, no joint
@@ -291,8 +294,8 @@ earlier 9,173-clip library; the [page](docs/index.html#recipe) explains each fac
 
 Of the official SuperMimic design choices ported onto this recipe, only `--muon_wd 0.1` clearly helps tracking.
 Widening the kernels from 0.35 to 0.6 keeps the five-set mean within noise and reduces foot slip under soft contact
-and other unseen perturbations ([page: Sim2real](docs/index.html#sim2real)). The shipped checkpoints were trained
-with `std_scale 0.35`; retrain for the new defaults.
+and other unseen perturbations ([page: Sim2real](docs/index.html#sim2real)). The shipped checkpoints use the
+project-page recipe (`std_scale 0.35`); retrain for the new defaults.
 
 ## Attribution and license
 
