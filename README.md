@@ -2,8 +2,9 @@
 
 **General humanoid motion tracking in minutes on one GPU.** PartyMimic trains one whole-body tracking policy for a
 41 h motion library on a single RTX 4090 and tracks motions it has never seen, on two humanoids (Unitree G1 and
-RoboParty RP1). This repository is the method: the training code, the data recipe built only from public datasets,
-the RP1 retargeting, the diversity analysis and the evaluation. Two trained checkpoints are included.
+RoboParty RP1). This repository is the method: the training code, the data recipe (public datasets plus our own
+kneeling and crawling clips, shipped here), the RP1 retargeting, the diversity analysis and the evaluation. Two
+trained checkpoints are included.
 
 - **Fast:** 28 min of training on 1× RTX 4090 (24 GB).
 - **Diverse data:** 41 h from LAFAN1, a diversity-selected 10k subset of BONES-SEED, KungfuAthlete, XtremeMotion and
@@ -16,8 +17,8 @@ the RP1 retargeting, the diversity analysis and the evaluation. Two trained chec
 PartyMimic is a model-based learner in the SuperMimic family. It fits an online MLP world model, trains the policy
 by backpropagating through 32 imagined steps of that model, and uses a critic beyond the horizon. Project page:
 [roboparty.github.io/PartyMimic](https://roboparty.github.io/PartyMimic/) ([`docs/index.html`](docs/index.html)),
-with videos, the data-diversity analysis, the recipe ablation, the SuperMimic full-factor ablation and a
-sim2real-oriented evaluation.
+with videos, the data-diversity analysis, the recipe ablation, the SuperMimic full-factor ablation, training to
+320k iterations, a sim2real-oriented evaluation with real-robot videos, and PartyMimic under a task agent.
 
 ![Mean held-out error against training compute](docs/static/hero.png)
 
