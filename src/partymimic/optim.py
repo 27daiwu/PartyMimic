@@ -43,15 +43,23 @@ class FlatAdam:
         self.gflat.zero_()  # the gradients stay views of gflat
 
     @torch.no_grad()
-    def step(self):
+    def step(self, ok: torch.Tensor | None = None):
+        """``ok``: optional 0-dim bool device tensor; where it is false the step is skipped (parameters, moments and
+        the step count unchanged) without a host read."""
         b1, b2 = self.betas
-        self.n_step.add_(1)
-        self.m.lerp_(self.gflat, 1 - b1)
-        self.v.mul_(b2).addcmul_(self.gflat, self.gflat, value=1 - b2)
-        bc1 = 1 - torch.pow(b1, self.n_step)
-        bc2 = 1 - torch.pow(b2, self.n_step)
+        if ok is None:
+            self.n_step.add_(1)
+            self.m.lerp_(self.gflat, 1 - b1)
+            self.v.mul_(b2).addcmul_(self.gflat, self.gflat, value=1 - b2)
+        else:
+            self.n_step.add_(ok.float())
+            self.m.copy_(torch.where(ok, self.m.lerp(self.gflat, 1 - b1), self.m))
+            self.v.copy_(torch.where(ok, self.v * b2 + (1 - b2) * self.gflat * self.gflat, self.v))
+        bc1 = 1 - torch.pow(b1, self.n_step.clamp(min=1))
+        bc2 = 1 - torch.pow(b2, self.n_step.clamp(min=1))
         denom = (self.v.sqrt() / bc2.sqrt()).add_(self.eps)
-        self.flat.sub_(self.m / denom * (self.param_groups[0]["lr"] / bc1))
+        d = self.m / denom * (self.param_groups[0]["lr"] / bc1)
+        self.flat.sub_(d if ok is None else torch.where(ok, d, 0.0))
 
     def state_dict(self):
         return {"flat_adam": True, "m": self.m, "v": self.v, "step": self.n_step}
@@ -137,6 +145,9 @@ class MuonAdam:
                 self.muon.step()
                 for t, k in zip(ps + bufs(), keep):
                     t.copy_(torch.where(ok, t, k))
+            if isinstance(self.adam, FlatAdam):
+                self.adam.step(ok=ok)
+                return
             assert self.adam.defaults["fused"], "a gated step needs the fused Adam (--fused_adam)"
             self.adam.found_inf = (~ok).float()  # the fused kernel skips the step and undoes the step count
             try:

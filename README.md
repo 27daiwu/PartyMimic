@@ -170,6 +170,35 @@ at 22.6 and 23.4 GB. Checkpoints are written every 2,000 iterations (`ckpt_00200
   held-out G1 ground transitions went from 120–415 mm to 24–36 mm in 2k iterations. It does not help on short,
   highly dynamic clips.
 
+**The project-page recipe.** The PartyMimic rows of the [project page](docs/index.html#results) add three groups
+of options to the defaults (all off by default), with `--std_scale 0.35`:
+
+```bash
+# per-clip motion features for the clip allocation, once per library (RP1 runs read the G1 library's file)
+uv run python tools/motion_prior.py data/motions/g1_mix data/motions/g1_mix_prior.npz --robot g1mj
+R=(--std_scale 0.35
+   --reset_alloc lp --start_alloc lp --alloc_lambda 0.15 --alloc_last 1 --cover_win 100000000
+   --motion_prior data/motions/g1_mix_prior.npz
+   --v_clip 10 --v_clip_raw --wm_guard 5 --v_guard 5 --action_noise 0
+   --wrist_kernel 0.5 --wrist_payload 2)
+bash scripts/train.sh logs/g1_page  --robot g1mj --motion_dir data/motions/g1_mix  --seed 0 --obs_err kp "${R[@]}"
+bash scripts/train.sh logs/rp1_page --robot rp1  --motion_dir data/motions/rp1_mix --seed 0 --obs_err kp "${R[@]}"
+# attention encoder: add --ref_enc xattn; sparse5: --interface sparse5 instead of --obs_err kp
+```
+
+- Clip allocation (`--reset_alloc lp --start_alloc lp`, `spot.Cover`): 15% of the resets, and the imagination
+  starts in the same proportion, go to the 8 motion clusters (of 128) with the largest training error relative to
+  the library, weighted by a prior that favours feasible, fast-rotating motion (`tools/motion_prior.py`: clips held
+  up by an object the simulator does not have are left out).
+- Long-run guards: the critic's value is clipped to the largest return (`--v_clip 10`, with the targets computed
+  from the unclipped value, `--v_clip_raw`), and a world-model or critic update whose loss is more than 5x its
+  running mean is skipped (`--wm_guard 5 --v_guard 5`); they keep runs far beyond 12k iterations from degrading.
+  `--action_noise 0` collects with the deterministic policy.
+- End effectors: an extra wrist-position kernel in the reward (`--wrist_kernel 0.5`), a payload of up to 2 kg at
+  each wrist that the policy does not observe (`--wrist_payload 2`, drawn once per env, none in 25% of them) and, on
+  the joint interface, the wrist / ankle / head error block that sparse5 observes (`--obs_err kp`, computed inside
+  the exported ONNX from the same inputs). Under a 2 kg payload they cut the wrist error by about two thirds.
+
 `uv run python -m partymimic.train -h` lists the remaining options.
 
 ## Evaluate, export, visualize

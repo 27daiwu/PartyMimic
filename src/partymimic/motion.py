@@ -28,6 +28,8 @@ SPARSE5_FRAME = 9 + 6 + 4 * 9
 # sparse5 observation block (mdp.MDP.kp_err): wrist / ankle position (4 x 3) and orientation (4 x 3, so3_log) errors and
 # the head orientation error (3) of the robot against reference frame f, both relative to their own pelvis heading frame
 SPARSE5_ERR = 4 * 3 + 4 * 3 + 3
+# --obs_err (joint interface only): "kp" adds sparse5's keypoint-error block for the decoder
+OBS_ERRS = ("none", "kp")
 
 
 def sparse5_bodies(tracked: tuple[str, ...]) -> list[int]:
@@ -156,12 +158,14 @@ class MotionLib:
         self.ref_contact = ((z < floor + margin) & (vh < vmax)).float()
 
     interface = "joint"
-    kp: list[int] | None = None  # sparse5: tracked-body indices of the keypoints (sparse5_bodies)
+    obs_err = "none"  # --obs_err: error block of the joint interface (mdp.obs_err_dim)
+    kp: list[int] | None = None  # sparse5 / --obs_err kp: tracked-body indices of the keypoints (sparse5_bodies)
 
-    def set_interface(self, interface: str, tracked: tuple[str, ...]) -> None:
+    def set_interface(self, interface: str, tracked: tuple[str, ...], obs_err: str = "none") -> None:
         assert interface in INTERFACES, interface
-        self.interface = interface
-        if interface == "sparse5":
+        assert obs_err in OBS_ERRS and (obs_err == "none" or interface == "joint"), (interface, obs_err)
+        self.interface, self.obs_err = interface, obs_err
+        if interface == "sparse5" or obs_err == "kp":
             self.kp = sparse5_bodies(tuple(tracked))
             self.kp_p, self.kp_R = self.body_p[:, self.kp].contiguous(), self.body_R[:, self.kp].contiguous()
 

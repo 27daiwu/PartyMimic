@@ -53,6 +53,10 @@ class DomainRandCfg:
     push_interval_s: tuple[float, float] | None = None
     push_velocity: tuple[float, ...] = (0.0,) * 6
     """Root velocity kick (x, y, z, roll, pitch, yaw half-ranges) every push_interval_s."""
+    wrist_payload: float = 0.0
+    payload_p0: float = 0.25
+    """--wrist_payload: point mass (kg) added at each wrist link's center of mass, once per env: none with probability
+    payload_p0, else uniform in [0, wrist_payload] per wrist."""
     reset_pos: tuple[float, float, float] = (0.05, 0.05, 0.01)
     reset_rot: tuple[float, float, float] = (0.1, 0.1, 0.2)
     reset_lin_vel: tuple[float, float, float] = (0.5, 0.5, 0.2)
@@ -101,6 +105,8 @@ class XiLayout:
                                 if not any(re.fullmatch(p, m.body(b).name) for p in excl)]  # fmt: skip
             add("link_mass", [sum(c.link_mass_range) / 2] * len(self.link_bodies),
                 [(c.link_mass_range[1] - c.link_mass_range[0]) / 2] * len(self.link_bodies))  # fmt: skip
+        if c.wrist_payload > 0:
+            add("payload", [c.wrist_payload / 2] * 2, [c.wrist_payload / 2] * 2)  # left, right wrist (kg)
         if c.solref_geoms is not None:
             add("solref", [sum(c.solref_timeconst) / 2, sum(c.solref_dampratio) / 2],
                 [max((c.solref_timeconst[1] - c.solref_timeconst[0]) / 2, 1e-6),
@@ -176,6 +182,11 @@ class DomainRandomizer:
         fields = {"geom_friction"}
         if c.com_mass_range is None and not eval_mode:
             fields.add("body_ipos")
+        if c.wrist_payload > 0:
+            wn = [n for n in robot.tracked_bodies if "_wrist_" in n]
+            wn = [next(n for n in wn if n.startswith(s)) for s in ("left", "right")]
+            self.wrist_body_ids = ent.indexing.body_ids[[ent.body_names.index(n) for n in wn]]
+            fields.add("body_mass")
         if c.solref_geoms is not None:
             fields.add("geom_solref")
         for func, cfg, _ in self._terms:
@@ -205,6 +216,14 @@ class DomainRandomizer:
             xi[:, self.layout.slices["solref"]] = sim.get_default_field("geom_solref")[self.solref_geoms[0]]
         if "qd_tau_scale" in self.layout.slices:
             xi[:, self.layout.slices["qd_tau_scale"]] = 1.0
+        if "payload" in self.layout.slices:
+            kg = torch.zeros(N, 2, device=dev)
+            if not self.eval_mode:
+                kg = torch.rand(N, 2, device=dev) * c.wrist_payload * (torch.rand(N, 1, device=dev) >= c.payload_p0)
+            xi[:, self.layout.slices["payload"]] = kg
+            b = self.wrist_body_ids
+            sim.model.body_mass[:, b] = sim.get_default_field("body_mass")[b] + kg
+            sim.recompute_constants(RecomputeLevel.set_const)
 
     # ------------------------------------------------------------------ per episode
     def reset_masked(self, xi: torch.Tensor, mask: torch.Tensor):
