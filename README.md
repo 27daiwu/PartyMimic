@@ -5,10 +5,11 @@
 RoboParty RP1). This repository is the method: the training code, the data recipe built only from public datasets,
 the RP1 retargeting, the diversity analysis and the evaluation. Two trained checkpoints are included.
 
-- **Fast:** 26 min of training on 1× RTX 4090 (24 GB).
-- **Diverse data:** 41 h from LAFAN1, a diversity-selected 10k subset of BONES-SEED and KungfuAthlete.
+- **Fast:** 28 min of training on 1× RTX 4090 (24 GB).
+- **Diverse data:** 41 h from LAFAN1, a diversity-selected 10k subset of BONES-SEED, KungfuAthlete, XtremeMotion and
+  our own kneeling and crawling clips.
 - **Generalizes:** zero-shot on five held-out test sets (Loco, Mani, Dance, Ground, Extreme martial arts).
-- **Precise:** 20.5 mm on the held-out manipulation clips (G1), the lowest error of every method we compared.
+- **Precise:** 21.4 mm on the held-out manipulation clips (G1), the lowest error of every method we compared.
 - **Two architectures:** an MLP reference encoder (default) or a cross-attention encoder (`--ref_enc xattn`).
 - **Two modalities:** joint-angle references (default) or the pelvis and five keypoints (`--interface sparse5`).
 
@@ -24,34 +25,39 @@ sim2real-oriented evaluation.
 
 Body position error (mm, lower is better), scored by the
 [sim2real leaderboard](https://egalahad.github.io/sim2real/leaderboard/) sim2sim evaluator (MuJoCo, every clip from
-its first frame). Loco, Mani, Dance and Ground are the MotionDecode splits; Extreme is the held-out 30% of
-KungfuAthlete (whole source videos held out). Mean is the mean of the five.
+its first frame to its end). The error is the local body position error over the tracked part of each clip, with the
+reference turned by the relative pelvis heading of robot and reference (no absolute heading). Loco, Mani, Dance and
+Ground are the MotionDecode splits; Extreme is the held-out 30% of KungfuAthlete (whole source videos held out). Mean
+is the mean of the five. Extreme success is the share of Extreme clips played to the end with the pelvis orientation
+error never above 57° for 0.2 s.
 
-| G1 | Training | Loco | Mani | Dance | Ground | Extreme | Mean |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| SONIC (official) | 21,000 GPU-h | 28.7 | 45.5 | 48.7 | 80.3 | 88.7 | 58.4 |
-| Mimic Lite v1.1 (official) | 50 GPU-h | 25.0 | 28.2 | 43.3 | 145.2 | 95.7 | 67.5 |
-| SuperMimic | 52 min | 34.9 | 34.3 | 55.5 | 119.2 | 95.5 | 67.9 |
-| NablaMimic | 120 min | 32.9 | 30.3 | 46.9 | 107.8 | 81.6 | 59.9 |
-| BlinkMimic | 59 min | 32.9 | 30.9 | 54.1 | 100.1 | 81.4 | 59.9 |
-| XMimic | 50 min | 32.3 | 30.6 | 53.5 | 101.3 | 83.1 | 60.2 |
-| **PartyMimic** (MLP) | **26 min** | 25.7 | **20.5** | 36.8 | 80.6 | 62.0 | 45.1 |
-| **PartyMimic** (attention) | 41 min | 25.1 | 21.1 | **35.0** | **76.2** | **60.3** | **43.5** |
+| G1 | Training | Loco | Mani | Dance | Ground | Extreme | Mean | Extreme success |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| SONIC (official) | 21,000 GPU-h | 28.7 | 45.5 | 48.6 | 65.7 | 87.0 | 55.1 | 74.7% |
+| Mimic Lite v1.1 (official) | 50 GPU-h | **25.0** | 28.3 | 43.3 | 93.6 | 95.4 | 57.1 | 46.8% |
+| SuperMimic | 99 min | 33.3 | 37.2 | 56.0 | 75.1 | 85.9 | 57.5 | 71.1% |
+| NablaMimic | 120 min | 32.4 | 30.2 | 47.7 | 73.4 | 79.5 | 52.6 | 67.7% |
+| BlinkMimic | 59 min | 32.4 | 30.6 | 54.6 | 66.4 | 83.3 | 53.5 | **74.8%** |
+| XMimic | 50 min | 33.8 | 30.8 | 54.5 | 63.8 | 82.8 | 53.1 | 74.5% |
+| **PartyMimic** (MLP) | **28 min** | 26.0 | **21.4** | 36.2 | 51.5 | 57.1 | 38.4 | 69.8% |
+| **PartyMimic** (attention) | 43 min | 25.1 | 21.7 | **34.7** | **51.0** | **54.4** | **37.4** | 74.4% |
 
-| RP1 | Training | Loco | Mani | Dance | Ground | Extreme | Mean |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| SuperMimic | 149 min | 34.8 | 29.1 | 53.4 | 162.5 | 90.2 | 74.0 |
-| BlinkMimic | 68 min | 33.7 | 27.3 | 50.3 | 110.5 | 80.3 | 60.4 |
-| XMimic | 59 min | 33.8 | 29.1 | 49.7 | 121.3 | 79.5 | 62.7 |
-| **PartyMimic** (MLP) | **26 min** | 23.4 | 16.5 | 35.3 | 105.1 | 58.9 | 47.8 |
-| **PartyMimic** (attention) | 42 min | **22.9** | **16.1** | **33.4** | **94.3** | **56.2** | **44.6** |
-| PartyMimic (sparse5, MLP) | 29 min | 24.7 | 19.1 | 38.3 | 100.9 | 60.7 | 48.7 |
+| RP1 | Training | Loco | Mani | Dance | Ground | Extreme | Mean | Extreme success |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| SuperMimic | 99 min | 35.1 | 34.4 | 53.2 | 93.1 | 81.1 | 59.4 | 69.2% |
+| BlinkMimic | 68 min | 32.1 | 28.0 | 49.8 | 80.9 | 77.4 | 53.6 | 75.2% |
+| XMimic | 59 min | 31.2 | 28.1 | 49.3 | 81.3 | 78.1 | 53.6 | **76.5%** |
+| **PartyMimic** (MLP) | **29 min** | 22.6 | **16.3** | 33.1 | **71.5** | 52.8 | 39.3 | 68.5% |
+| **PartyMimic** (attention) | 43 min | **22.4** | 16.5 | **31.8** | 71.7 | **51.3** | **38.7** | 73.2% |
+| PartyMimic (sparse5, MLP) | 31 min | 23.8 | 19.2 | 36.5 | 76.5 | 55.4 | 42.3 | 69.0% |
+| PartyMimic (sparse5, attention) | 47 min | 23.3 | 18.5 | 35.5 | 74.0 | 55.1 | 41.3 | 73.1% |
 
-<sub>SuperMimic (paper hyperparameters), NablaMimic (official config), BlinkMimic (main preset), XMimic (its defaults)
-and PartyMimic were all trained by us on the same library (G1: LAFAN1 + BONES-SEED subset + KungfuAthlete train
-split; RP1: the same clips retargeted to RP1), each run on one RTX 4090; 2-seed means. Time is training wall-clock.
-SONIC and Mimic Lite are official leaderboard checkpoints with other data and hardware. Completion rates and the
-full protocol are on the [project page](docs/index.html#results).</sub>
+<sub>SuperMimic (the authors' code on a rebuilt mjlab interface), NablaMimic (official config), BlinkMimic (main
+preset), XMimic (BlinkMimic main in JAX) and PartyMimic were all trained by us on the same 10,745-clip library
+([Data](#data); RP1: the same clips retargeted to RP1) for 12,000 iterations (NablaMimic: its 2-hour budget), each run
+on one RTX 4090; 2-seed means. PartyMimic uses the [project-page recipe](#train). Time is training wall-clock. SONIC
+and Mimic Lite are the official policies, evaluated as released (G1 only). Completion rates and the full protocol are
+on the [project page](https://roboparty.github.io/PartyMimic/#results).</sub>
 
 ## Checkpoints
 
@@ -61,6 +67,9 @@ Two checkpoints, the default recipe (MLP encoder, joint references), seed 0, 12,
 |---|---|---:|---:|---:|---:|---:|---:|---:|
 | [`checkpoints/g1_mlp.pt`](checkpoints/g1_mlp.pt) | G1 (`--robot g1mj`) | 27 min | 25.5 | 20.6 | 36.7 | 82.6 | 61.9 | 45.5 |
 | [`checkpoints/rp1_mlp.pt`](checkpoints/rp1_mlp.pt) | RP1 (`--robot rp1`) | 29 min | 23.3 | 16.5 | 35.5 | 102.3 | 59.2 | 47.4 |
+
+These checkpoints come from the first release: its default recipe (before the project-page recipe), scored with the
+absolute-heading error, so their numbers are not comparable to the results above.
 
 Each holds the policy, world model and critic (no optimizer state). Export for the sim2real controller (sim2sim
 and real robot), score, or fine-tune:
