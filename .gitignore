@@ -22,3 +22,12 @@ results/
 .venv/
 
 deploy/g1_fasttrack/.sdk_target/
+
+deploy/dist*
+
+deploy/partymimic_*.zip
+deploy/partymimic/test*
+deploy/partymimic/tool*
+
+
+deploy/make_zip.sh

@@ -31,6 +31,7 @@ class Fault(str, enum.Enum):
     GYRO = "GYRO"                          # |gyro| beyond bound
     CMD_INVALID = "CMD_INVALID"            # NaN / inf command from policy
     ESTOP = "ESTOP"                        # operator e-stop (key / file / signal)
+    REMOTE_STOP = "REMOTE_STOP"            # remote controller: START double-click
     WATCHDOG = "WATCHDOG"                  # control loop stalled
     LOOP_OVERRUN = "LOOP_OVERRUN"          # repeated control period overruns
     INFERENCE = "INFERENCE"                # policy inference exception

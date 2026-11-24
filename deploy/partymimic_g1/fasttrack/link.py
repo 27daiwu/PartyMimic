@@ -40,34 +40,17 @@ class LinkState:
     rpy: tuple = (0.0, 0.0, 0.0)
     motor_mode: tuple = ()      # per-joint motor_state.mode (29)
     motor_flags: tuple = ()     # per-joint motor_state.motorstate (29)
+    wireless: bytes = b""       # rt/lowstate.wireless_remote (40 bytes): remote controller keys
 
 
 class Link:
-    """Interface used by SafeRobotIO / guardian / preflight. Implemented by DdsUserCtrlLink and test fakes."""
+    """Interface used by the runner / guardian / session. Implemented by DdsUserCtrlLink and test fakes."""
 
     def latest(self) -> Optional[LinkState]: ...
+    def add_state_listener(self, fn) -> None: ...
     def enable_write(self) -> None: ...
     def send(self, q, dq, tau, kp, kd) -> None: ...
     def get_fsm(self) -> tuple[int, Optional[int]]: ...           # (rpc_code, fsm_id)
-    # Read-only RPC whitelist (diagnostics). State-changing ids (7101 SetFsmId, 7102.., 7105 SetVelocity, 7110, 7111, 7100 fsm_api)
-    # are NOT reachable through this method.
-    READ_ONLY_API_IDS = {7001: "GetFsmId", 7002: "GetFsmMode", 7003: "GetBalanceMode", 7004: "GetSwingHeight", 7005: "GetStandHeight"}
-
-    def rpc_read(self, api_id: int):
-        if api_id not in self.READ_ONLY_API_IDS:
-            raise PermissionError(f"api id {api_id} is not in the read-only whitelist")
-        try:
-            code, data = self._loco._Call(api_id, "{}")
-        except Exception as e:
-            return -1, repr(e)
-        return int(code), data
-
-    def server_api_version(self):
-        try:
-            return self._loco.GetServerApiVersion()
-        except Exception as e:
-            return -1, repr(e)
-
     def switch_to_user(self) -> int: ...
     def switch_to_internal(self, mode: str) -> int: ...
     def command_topic_rx_count(self) -> int: ...
@@ -97,8 +80,10 @@ class DdsUserCtrlLink(Link):
         self._rx_seq = 0
         self._own_writes = 0
         self._cmd_rx = 0
+        self._active_rx_tm = 0.0
         self._cmd_rx_t0 = time.monotonic()
         self._closed = False
+        self._listeners: list = []
 
         ChannelFactoryInitialize(domain_id, interface)
         self._sub_state = ChannelSubscriber(self.STATE_TOPIC, LowState_)
@@ -128,13 +113,22 @@ class DdsUserCtrlLink(Link):
                            np.asarray(msg.imu_state.gyroscope, np.float64), int(msg.tick), int(msg.mode_machine),
                            time.monotonic(), 0, int(msg.mode_pr), tuple(int(v) for v in msg.version),
                            tuple(float(v) for v in msg.imu_state.rpy),
-                           tuple(int(ms[i].mode) for i in range(N_JOINTS)), tuple(int(ms[i].motorstate) for i in range(N_JOINTS)))
+                           tuple(int(ms[i].mode) for i in range(N_JOINTS)), tuple(int(ms[i].motorstate) for i in range(N_JOINTS)),
+                           bytes(int(b) & 0xFF for b in msg.wireless_remote))
         except Exception:
             return
         with self._state_lock:
             self._rx_seq += 1
             st.seq = self._rx_seq
             self._latest = st
+        for fn in self._listeners:          # cheap, non-blocking callbacks only (e.g. the START double-click detector)
+            try:
+                fn(st)
+            except Exception:
+                pass
+
+    def add_state_listener(self, fn) -> None:
+        self._listeners.append(fn)
 
     def _poll_cmd(self) -> None:
         while not self._cmd_poll_stop.is_set():
@@ -147,6 +141,11 @@ class DdsUserCtrlLink(Link):
                 if smp is None:
                     break
                 self._cmd_rx += 1; n += 1
+                try:                       # stiff (policy-like) frame = any kp > 0; damping/zero frames do not count
+                    if any(smp.motor_cmd[i].kp > 0.0 for i in range(N_JOINTS)):
+                        self._active_rx_tm = time.monotonic()
+                except Exception:
+                    pass
             time.sleep(0.005)
 
     def latest(self) -> Optional[LinkState]:
@@ -160,6 +159,12 @@ class DdsUserCtrlLink(Link):
         if self._pub is None:
             self._pub, self._cmd_msg = self._mk_pub()
             self._pub.Init()
+
+    def prime(self) -> None:
+        """Pre-build everything a take-over needs (publisher, message, CRC path) WITHOUT putting a sample on the wire."""
+        self.enable_write()
+        from .crc import lowcmd_crc
+        lowcmd_crc(self._cmd_msg)
 
     def send(self, q, dq, tau, kp, kd) -> None:
         if self.read_only or self._pub is None:
@@ -194,25 +199,6 @@ class DdsUserCtrlLink(Link):
             return -1, None
         return int(code), (None if data is None else int(data))
 
-    # Read-only RPC whitelist (diagnostics). State-changing ids (7101 SetFsmId, 7102.., 7105 SetVelocity, 7110, 7111, 7100 fsm_api)
-    # are NOT reachable through this method.
-    READ_ONLY_API_IDS = {7001: "GetFsmId", 7002: "GetFsmMode", 7003: "GetBalanceMode", 7004: "GetSwingHeight", 7005: "GetStandHeight"}
-
-    def rpc_read(self, api_id: int):
-        if api_id not in self.READ_ONLY_API_IDS:
-            raise PermissionError(f"api id {api_id} is not in the read-only whitelist")
-        try:
-            code, data = self._loco._Call(api_id, "{}")
-        except Exception as e:
-            return -1, repr(e)
-        return int(code), data
-
-    def server_api_version(self):
-        try:
-            return self._loco.GetServerApiVersion()
-        except Exception as e:
-            return -1, repr(e)
-
     def switch_to_user(self) -> int:
         if self.read_only:
             raise RuntimeError("read-only link cannot switch")
@@ -231,6 +217,9 @@ class DdsUserCtrlLink(Link):
 
     def command_topic_rx_count(self) -> int:
         return self._cmd_rx
+
+    def last_active_rx_tm(self) -> float:
+        return self._active_rx_tm
 
     def close(self) -> None:
         if self._closed:

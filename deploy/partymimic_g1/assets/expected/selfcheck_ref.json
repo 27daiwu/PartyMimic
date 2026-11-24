@@ -1,0 +1,11 @@
+{
+ "loader_fingerprint": "2546f98159cbac249040bc64761e89dfb68be4468bc3f323b640681cc105e075",
+ "motion_steps": 354,
+ "made_on": "Linux-6.8.0-149-generic-x86_64-with-glibc2.35",
+ "machine": "x86_64",
+ "python": "3.10.12",
+ "onnxruntime": "1.23.2",
+ "torch": "2.13.0",
+ "frames": 354,
+ "dev_tick_ms_p50": 1.4476454816758633
+}

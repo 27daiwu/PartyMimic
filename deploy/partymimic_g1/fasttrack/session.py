@@ -19,7 +19,9 @@ import numpy as np
 
 from .guard import Fault, GuardReject, SafetyGuard
 from .link import Link, LinkState
-from .profile import FwProfile, get_profile, entry_check, resolve_exit_mode
+from .profile import FwProfile, get_profile, entry_check, decide_exit_mode, ATTITUDE_MAX_AGE_S
+from .handback import handback
+from .remote import StartDoubleClick, start_pressed
 
 
 @dataclass
@@ -27,11 +29,11 @@ class SessionConfig:
     lock_path: str = "/tmp/partymimic_g1_control.lock"
     estop_file: str = "/tmp/partymimic_g1_ESTOP"
     profile: FwProfile = field(default_factory=lambda: get_profile("demo_walkrun"))
-    declared_entry_fsm: Optional[int] = None  # operator-declared observed entry fsm (REQUIRED for real runs; R1: no hard-coded value)
+    entry_allowed: Optional[tuple] = None     # WalkRun-like fsm ids a take-over may start from (None = any except 0/1); config/site.json
     expect_user_fsm: Optional[int] = None     # override profile.user_fsm_expected (None = use profile)
     internal_exit_mode: Optional[str] = None  # override profile.exit_mode (AUTO|LAST|PASSIVE|WALKRUN)
     damp_hz: float = 100.0
-    damp_before_release_s: float = 0.5
+    damp_before_release_s: float = 0.1        # R2: was 0.5 s of kp=0 before the exit RPC (a standing robot falls meanwhile); demo sends the RPC at once
     foreign_writer_listen_s: float = 1.0
     min_state_hz: float = 30.0
     quiescent_dq: float = 0.5                 # rad/s: required before taking control
@@ -39,6 +41,10 @@ class SessionConfig:
     watchdog_s: float = 0.10                  # control loop heartbeat timeout
     confirm_timeout_s: float = 3.0
     unconfirmed_exit_hold_s: float = 30.0
+    attitude_wait_s: float = 2.0              # while damping, wait this long for a FRESH attitude before choosing the exit mode
+    handback_dwell_s: float = 0.3
+    remote_stop_enabled: bool = True          # START double-click on the remote controller (rt/lowstate.wireless_remote)
+    remote_window_s: float = 0.3
     fsm_poll_s: Optional[float] = None        # None -> profile.fsm_recheck_s
 
     @property
@@ -66,9 +72,18 @@ class ExclusiveLock:
             os.close(self.fd); self.fd = None
             self.holder = holder
             return False
-        os.ftruncate(self.fd, 0)
-        os.pwrite(self.fd, json.dumps({"pid": os.getpid(), "t": time.time(), "argv": sys.argv[:6]}).encode(), 0)
+        self.info = {"pid": os.getpid(), "t": time.time(), "argv": sys.argv[:6]}
+        self._write()
         return True
+
+    def _write(self):
+        os.ftruncate(self.fd, 0)
+        os.pwrite(self.fd, json.dumps(self.info).encode(), 0)
+
+    def update(self, **kw):
+        """Publish extra facts to whoever reads the lock (the guardian reads the entry fsm here to restore the right state)."""
+        if self.fd is not None:
+            self.info.update(kw); self._write()
 
     def release(self):
         if self.fd is not None:
@@ -95,6 +110,7 @@ class ControlSession:
         self.user_fsm_seen: Optional[int] = None
         self.last_cmd = None
         self.events: list[dict] = []
+        self.on_event = None                      # optional callback(event dict): the runner streams events to logs/ the moment they happen
         self.exit_report: dict | None = None
         self.n_sent = 0
         self._last_state_seq = -1
@@ -103,14 +119,31 @@ class ControlSession:
         self._fsm_th: Optional[threading.Thread] = None
         self.fsm_polls = {"ok": 0, "fail": 0}
         self.exit_mode_used: Optional[str] = None
+        self.timeline: dict = {}                  # CLOCK_MONOTONIC stamps (comparable across processes on this host)
+        self._wake = threading.Event()
+        self._remote = StartDoubleClick(window_s=self.cfg.remote_window_s)
+        self._remote_fired_tm: Optional[float] = None
+        if self.cfg.remote_stop_enabled:
+            try:
+                self.link.add_state_listener(self._on_remote_sample)
+            except Exception:
+                pass
+
+    def _on_remote_sample(self, st) -> None:
+        """Runs in the DDS reader thread: only sets a flag (no locks, no I/O)."""
+        if self._remote.feed(st.arrival_mono, start_pressed(st.wireless)) and self._remote_fired_tm is None:
+            self._remote_fired_tm = time.monotonic(); self._wake.set()
 
     # ------------------------------------------------------------------ utilities
     def now(self) -> float:
         return time.monotonic() - self.t0
 
     def event(self, kind: str, **kw):
-        e = {"t": round(self.now(), 4), "kind": kind, **kw}
+        e = {"t": round(self.now(), 4), "tm": time.monotonic(), "kind": kind, **kw}
         self.events.append(e); self.log(f"[session] {json.dumps(e, default=str)}")
+        if self.on_event is not None:
+            try: self.on_event(e)
+            except Exception: pass
 
     def _damp_cmd(self, n=29):
         z = np.zeros(n)
@@ -133,13 +166,13 @@ class ControlSession:
         return f
 
     # ------------------------------------------------------------------ gates before touching the robot
-    def preflight(self, listen_s: float | None = None) -> tuple[bool, list[dict]]:
+    def preflight(self, listen_s: float | None = None, rate_window_s: float = 1.0) -> tuple[bool, list[dict]]:
         """Read-only checks (no publisher use, no RPC that changes state). Returns (ok, results)."""
         c = self.cfg; res = []
         def add(name, ok, detail=""):
             res.append({"check": name, "pass": bool(ok), "detail": detail})
         # 1. stream alive and fast enough
-        t_end = time.monotonic() + 1.0; seqs = []
+        t_end = time.monotonic() + rate_window_s; seqs = []
         first = None
         while time.monotonic() < t_end:
             st = self.link.latest()
@@ -167,7 +200,7 @@ class ControlSession:
         # 3. FSM (read-only RPC)
         code, fsm = self.link.get_fsm()
         add("fsm_query", code == 0 and fsm is not None, f"code={code} fsm={fsm}")
-        ok_e, why = entry_check(c.profile, fsm, c.declared_entry_fsm)
+        ok_e, why = entry_check(c.profile, fsm, c.entry_allowed)
         add("fsm_entry_allowed", ok_e, f"profile={c.profile.name}: {why}")
         em = c.profile.expected_mode_machine
         add("mode_machine_matches", em is None or st.mode_machine in (0, em), f"lowstate.mode_machine={st.mode_machine} expected {em} (0 = simulation, as in the official check_mode_machine)")
@@ -183,13 +216,16 @@ class ControlSession:
         return all(r["pass"] for r in res), res
 
     # ------------------------------------------------------------------ acquire / switch
-    def acquire(self) -> bool:
-        """OEM -> USER handover following the official example: damping frame, SwitchToUserCtrl, confirm."""
+    def acquire(self, fast: bool = False) -> bool:
+        """OEM -> USER handover following the official example: damping frame, SwitchToUserCtrl, confirm.
+        fast=True (GO after a full READY check): the state-dependent preflight repeats with 0.3 s windows instead of 1 s."""
         c = self.cfg
-        ok, res = self.preflight()
+        ok, res = self.preflight(listen_s=0.3, rate_window_s=0.3) if fast else self.preflight()
         self.event("preflight", ok=ok, failed=[r for r in res if not r["pass"]])
         if not ok:
             self.guard.trip(Fault.SWITCH_FAILED, "preflight failed", self.now()); return False
+        if self._remote_fired_tm is not None:                     # START x2 during the preflight: stop BEFORE control is taken
+            self.guard.trip(Fault.REMOTE_STOP, "remote START double-click before control was taken", self.now()); return False
         if not self._lock.acquire():
             self.guard.trip(Fault.LOCK_LOST, f"exclusive lock held: {getattr(self._lock, 'holder', '')}", self.now()); self.event("lock_denied"); return False
         self.event("lock_acquired", path=c.lock_path)
@@ -198,9 +234,13 @@ class ControlSession:
         if self.link.command_topic_rx_count() != n0:
             self.guard.trip(Fault.LOCK_LOST, "foreign writer appeared on rt/user_lowcmd", self.now()); self._lock.release(); return False
         code, self.entry_fsm = self.link.get_fsm()
-        ok_e, why = entry_check(c.profile, self.entry_fsm, c.declared_entry_fsm)
+        ok_e, why = entry_check(c.profile, self.entry_fsm, c.entry_allowed)
         if not ok_e:
             self.guard.trip(Fault.SWITCH_FAILED, f"entry fsm rejected after lock: {why}", self.now()); self._lock.release(); return False
+        if self._remote_fired_tm is not None:
+            self.guard.trip(Fault.REMOTE_STOP, "remote START double-click before control was taken", self.now()); self._lock.release(); return False
+        self._lock.update(entry_fsm=self.entry_fsm)
+        self.event("entry_checked", entry_fsm=self.entry_fsm, why=why)
         st = self.link.latest()
         self.guard.reset_target(st.q)
         self.link.enable_write()
@@ -235,6 +275,7 @@ class ControlSession:
         self.user_fsm_seen = fsm
         with self._lk:
             if self.mode == self.ACQUIRE:
+                self.heartbeat()          # R2: the watchdog starts judging the moment NORMAL is set; the loop heartbeat is seconds old after ARM
                 self.mode = self.NORMAL
         self.event("user_control_confirmed", entry_fsm=self.entry_fsm, user_fsm=fsm, strong=c.user_fsm is not None,
                    note=("fsm == profile value" if c.user_fsm is not None else "weak: fsm id changed (no official value in this profile)"))
@@ -244,6 +285,10 @@ class ControlSession:
     # ------------------------------------------------------------------ command path
     def _send_raw(self, q, dq, tau, kp, kd):
         self.link.send(q, dq, tau, kp, kd); self.n_sent += 1
+        if self.mode in (self.NORMAL, self.ACQUIRE):
+            self.timeline["last_stiff_send_tm"] = time.monotonic()      # last policy/hold frame handed to DDS (NORMAL mode only)
+        if self.mode == self.DAMP and "first_damp_frame_tm" not in self.timeline:
+            self.timeline["first_damp_frame_tm"] = time.monotonic()
 
     def heartbeat(self):
         self._heartbeat = time.monotonic()
@@ -271,8 +316,15 @@ class ControlSession:
         """Latch a fault and take over writing with damping. Safe from any thread / signal handler. Never blocks on RPC."""
         with self._lk:
             self.guard.trip(fault, detail, self.now())
+            self.timeline.setdefault("emergency_tm", time.monotonic())
             if self.mode in (self.NORMAL, self.ACQUIRE):
                 self.mode = self.DAMP
+                try:                                  # do not wait for the 100 Hz streamer: first damping frame goes out right now
+                    q, dq, tau, kp, kd = self._damp_cmd(); st = self.link.latest()
+                    if st is not None and np.isfinite(st.q).all(): q = st.q
+                    self._send_raw(q, dq, tau, kp, kd)
+                except Exception as e:
+                    self.log(f"[session] immediate damp frame failed {e!r}")
                 self.event("EMERGENCY_DAMP", fault=self.guard.fault.value, trigger=fault.value, detail=detail)
             elif self.mode == self.OFF:
                 self.event("fault_before_control", fault=self.guard.fault.value, detail=detail)
@@ -286,7 +338,10 @@ class ControlSession:
     def _watch(self):
         c = self.cfg
         while not self._stop.is_set():
-            time.sleep(0.01)
+            self._wake.wait(0.005); self._wake.clear()
+            if self._remote_fired_tm is not None and self.mode in (self.NORMAL, self.ACQUIRE) and not self.guard.tripped:
+                self.timeline.setdefault("trigger_seen_tm", self._remote_fired_tm)
+                self.emergency(Fault.REMOTE_STOP, "remote controller START double-click"); continue
             if self.mode != self.NORMAL:
                 continue
             if time.monotonic() - self._heartbeat > c.watchdog_s:
@@ -343,11 +398,20 @@ class ControlSession:
                 nxt = time.perf_counter()
 
     # ------------------------------------------------------------------ exit
+    def _remode(self):
+        """Re-evaluate the exit mode from the current attitude (used before a retried exit RPC)."""
+        stq = self.link.latest(); age = None if stq is None else time.monotonic() - stq.arrival_mono
+        m, why = decide_exit_mode(self.cfg.exit_mode, None if stq is None else stq.quat_wxyz, age, self.guard.fault.value)
+        self.exit_mode_used = m; self._why_latest = why; self.event("exit_mode_recheck", mode=m, why=why)
+        return m, self.cfg.profile.expected_exit_fsm(m)
+
     def finish(self, reason: str = "normal") -> dict:
-        """Damp, hand back to the internal controller, VERIFY. Idempotent. Returns the exit report."""
+        """Damp, hand back to the internal controller, VERIFY. Idempotent. Returns the exit report.
+        confirmed=True only when GetFsmId proves the OEM has control (see handback.py); anything else is reported as a FAILED exit."""
         c = self.cfg
         if self.exit_report is not None:
             return self.exit_report
+        self.timeline["finish_start_tm"] = time.monotonic()
         rep = {"reason": reason, "fault": self.guard.fault.value, "internal_mode": c.exit_mode, "rpc_code": None,
                "fsm_after": None, "confirmed": None, "streamed_damp": False}
         if self.mode == self.OFF:
@@ -370,42 +434,38 @@ class ControlSession:
                 # control already left the user fsm (OEM took it back / firmware watchdog): do NOT send a second switch request
                 rep.update(confirmed=True, fsm_after=fsm_now, note=f"fsm already {fsm_now} != user fsm {self.user_fsm_seen}: no exit RPC sent")
                 self.event("exit_not_needed_already_internal", fsm=fsm_now); time.sleep(0.2); self._cleanup(); self.exit_report = rep; return rep
-        stq = self.link.latest()
-        mode = resolve_exit_mode(c.exit_mode, None if stq is None else stq.quat_wxyz)
-        self.exit_mode_used = mode; rep["internal_mode"] = mode; rep["exit_mode_rule"] = c.exit_mode
-        rc = self.link.switch_to_internal(mode)
-        rep["rpc_code"] = rc; self.event("SwitchToInternalCtrl", rpc_code=rc, mode=mode, rule=c.exit_mode)
-        if rc in (3203, 3204, 3102):
-            # explicit rejection / not sent: the request definitely did not execute, ONE retry is safe.
-            # Timeouts (3104) and unknown errors are NOT retried blindly (the request may still execute).
-            time.sleep(0.3)
-            rc = self.link.switch_to_internal(mode)
-            rep["rpc_code"] = rc; rep["retried_once_after_explicit_rejection"] = True
-            self.event("SwitchToInternalCtrl_retry", rpc_code=rc)
-        t_end = time.monotonic() + c.confirm_timeout_s; fsm = None
-        while time.monotonic() < t_end:
-            code, fsm = self.link.get_fsm()
-            if rc == 0 and code == 0 and fsm is not None and fsm != self.user_fsm_seen:
-                rep["confirmed"] = True; break
-            time.sleep(0.1)
-        rep["fsm_after"] = fsm
+        # exit mode: needs a FRESH attitude; while damping we may wait briefly for one (comm glitches), else PASSIVE
+        mode, why = None, ""
+        t_end = time.monotonic() + c.attitude_wait_s
+        while True:
+            stq = self.link.latest()
+            age = None if stq is None else time.monotonic() - stq.arrival_mono
+            mode, why = decide_exit_mode(c.exit_mode, None if stq is None else stq.quat_wxyz, age, self.guard.fault.value)
+            if c.exit_mode != "AUTO" or mode == "WALKRUN" or self.guard.fault.value in ("TILT", "STATE_INVALID", "STATE_FROZEN") or time.monotonic() > t_end \
+                    or (age is not None and age <= ATTITUDE_MAX_AGE_S):
+                break
+            time.sleep(0.02)
+        self.exit_mode_used = mode; rep["internal_mode"] = mode; rep["exit_mode_rule"] = c.exit_mode; rep["exit_mode_why"] = why
+        self.event("exit_mode", mode=mode, why=why)
+        hb = handback(self.link, mode=mode, user_fsm=self.user_fsm_seen, expected_fsm=self.cfg.profile.expected_exit_fsm(mode),
+                      confirm_timeout_s=c.confirm_timeout_s, dwell_s=c.handback_dwell_s, hold_unconfirmed_s=c.unconfirmed_exit_hold_s, log=self.log,
+                      remode=self._remode)
+        rep["handback"] = hb
+        rep["internal_mode"] = hb["mode_requested"]; self.exit_mode_used = hb["mode_requested"]
+        if hb.get("mode_changed_before_retry"): rep["exit_mode_why"] = getattr(self, "_why_latest", why) + " (re-decided before the retried exit RPC)"      # may differ from the first decision if a retry re-decided it
+        rep["rpc_code"] = hb["rpc_code"]; rep["fsm_after"] = hb["fsm_after"]; rep["confirmed"] = bool(hb["confirmed"])
+        rep["retried_once_after_explicit_rejection"] = hb["retried_once_after_explicit_rejection"]
+        self.timeline["rpc_first_sent_tm"] = hb["t_rpc_first_sent"]; self.timeline["handback_confirmed_tm"] = hb["t_confirmed"]
+        self.event("SwitchToInternalCtrl", rpc_code=hb["rpc_code"], mode=mode, rule=c.exit_mode, calls=len(hb["rpc_calls"]))
         if not rep["confirmed"]:
-            rep["confirmed"] = False
-            self.event("EXIT_UNCONFIRMED", rpc_code=rc, fsm=fsm,
-                       action=f"keep DAMPING for up to {c.unconfirmed_exit_hold_s:.0f}s; use remote damping / power cut; do NOT approach")
-            t_end = time.monotonic() + c.unconfirmed_exit_hold_s
-            try:
-                while time.monotonic() < t_end:
-                    time.sleep(0.2)
-                    code, f2 = self.link.get_fsm()
-                    if code == 0 and f2 is not None and f2 != self.user_fsm_seen and rc == 0:
-                        rep["confirmed"], rep["fsm_after"] = True, f2; break
-            except KeyboardInterrupt:
-                pass
+            self.event("EXIT_UNCONFIRMED", rpc_code=hb["rpc_code"], fsm=hb["fsm_after"],
+                       action=f"kept DAMPING for up to {c.unconfirmed_exit_hold_s:.0f}s; use remote damping / power cut; do NOT approach")
         # tail: a few more damping frames then stop writing (official example stops writing after the switch)
         time.sleep(0.2)
+        self.timeline["last_frame_tm"] = time.monotonic()
         self._cleanup()
-        self.event("released", confirmed=rep["confirmed"], fsm_after=rep["fsm_after"])
+        self.event("released", confirmed=rep["confirmed"], fsm_after=rep["fsm_after"], via=hb.get("confirmed_via"), mode_matched=hb.get("mode_matched"))
+        rep["timeline"] = dict(self.timeline)
         self.exit_report = rep
         return rep
 

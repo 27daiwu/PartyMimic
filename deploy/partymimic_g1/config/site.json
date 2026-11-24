@@ -1,0 +1,9 @@
+{
+  "entry_fsm_allowed": [500, 505, 801],
+  "_entry_fsm_note": "WalkRun-like fsm ids a take-over may start from. 505/801 are the ids wbc_nx/remote_start launches from on this robot, 500 is the SDK Start() id. 0 (ZeroTorque) and 1 (Damp) are ALWAYS refused. ./start.sh --entry-fsm N narrows this to one id.",
+  "oem_lowcmd_writer": {
+    "confirmed": false,
+    "expected_writers": null,
+    "_note": "BLOCKER until filled: in WalkRun the OEM motion service writes rt/lowcmd. The check lists the DDS writers it sees on rt/lowcmd (logs/runs/*/ready.json). When the OEM confirms in writing that these are its own service, set confirmed=true and expected_writers=<that count>; any other count blocks motion."
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "verified": true,
+  "source": "wbc_nx/remote_start/include/gamepad.hpp (xKeySwitchUnion on rt/lowstate.wireless_remote bytes 2..3), reused as verified on the robot",
+  "notes": "F3 = the bit the SDK calls F2 (byte2 bit7). If F1+F3 does not react, look at logs/keys.log: it prints the raw bytes of every key change and any unmapped bit.",
+  "keys": {
+    "R1": [2, 0], "L1": [2, 1], "START": [2, 2], "SELECT": [2, 3], "R2": [2, 4], "L2": [2, 5], "F1": [2, 6], "F3": [2, 7],
+    "A": [3, 0], "B": [3, 1], "X": [3, 2], "Y": [3, 3], "UP": [3, 4], "RIGHT": [3, 5], "DOWN": [3, 6], "LEFT": [3, 7]
+  },
+  "combos": {"load": ["F1", "F3"], "go": ["L1", "A"]}
+}
