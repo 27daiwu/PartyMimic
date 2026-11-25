@@ -1,0 +1,6 @@
+06f02449ecca31877dcf96f33100663953abe555dc9edc1aaf8de67c26ea3b01  policy.onnx
+fe62993f65b7fd13fc95ccfdec7bf19fb7b326a4906afdd42b547adcc2d60292  policy_params.txt
+0d58d64ec6dec63de83a76c3a562ba8a4cbf240d15f9f9e80fddc44731f56f35  motion.bin
+d7ec59dae28015e87d037dd1161c6e85cd19567fd3c99a5ac4f300aa82ce0d21  fk_chain.txt
+# provenance (dev inputs, not shipped): yaml 1b52fe3069476ddb6947a198854faf33b6af0a25efee46d8b8859ea7dbbfebac  ssb_motion.npz d4d4d936a670d54e1cca5bf0f059f1ee9fc79f17733a64a859b1e929d6084cc6
+# policy.onnx = P4 candidate robust_d it12000 (results/p4/training/p4_robust_d); frozen P2 baseline policy.onnx sha256 0c51d5f26de2698ec6922cb3005410f714a1ac573b665b22b134be389fb1b9a6 kept in results/p4/baseline_frozen

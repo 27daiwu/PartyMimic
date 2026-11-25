@@ -1,0 +1,2 @@
+# offline FK chain root(pelvis) -> pelvis: per link  <joint|-> body_quat_wxyz(4) joint_axis(3)
+anchor pelvis

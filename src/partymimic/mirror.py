@@ -26,7 +26,7 @@ class Mirror:
         self.sign = torch.tensor(robot.mirror_sign or sign, device=device)
         self.M = torch.diag(torch.tensor([1.0, -1.0, 1.0], device=device))
         self.xi_slices = xi_slices
-        unknown = set(xi_slices) - {"friction", "joint_offset", "com", "payload"}
+        unknown = set(xi_slices) - {"friction", "joint_offset", "com", "payload", "kp", "kd", "delay"}
         assert not unknown, f"mirror of sim-context entries {unknown} not defined"
 
     def joints(self, x: torch.Tensor) -> torch.Tensor:
@@ -45,4 +45,8 @@ class Mirror:
         out[..., c.start + 1] = -xi[..., c.start + 1]  # lateral COM offset
         if "payload" in self.xi_slices:  # left / right wrist
             out[..., self.xi_slices["payload"]] = xi[..., self.xi_slices["payload"]].flip(-1)
+        for k in ("kp", "kd"):  # P4: per-joint gain scales follow the joint permutation (positive scales: no sign)
+            if k in self.xi_slices:
+                sl = self.xi_slices[k]
+                out[..., sl] = xi[..., sl][..., self.perm]
         return out

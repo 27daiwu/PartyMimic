@@ -127,6 +127,9 @@ class TrackingSim:
         dev = self.device
         self.default_q = self.robot.data.default_joint_pos[0].clone()
         self.alpha = torch.tensor(robot.action_scale_list(), device=dev)
+        # P4: per-env command delay (physics substeps, set by DomainRandomizer.startup) and the previous control step's target
+        self.cmd_delay = torch.zeros(self.N, dtype=torch.long, device=dev)
+        self.prev_target = self.default_q.unsqueeze(0).repeat(self.N, 1).clone()
 
         # ---- sim context xi (layout in partymimic.dr; paper setup: friction, joint offsets, com offset) ----
         self.layout = XiLayout(robot, dev)
@@ -229,6 +232,23 @@ class TrackingSim:
         # a clip's last bin can hold only its last frame (start == clip_end)
         return torch.minimum(f, clip_end - 1), bins
 
+    def _oem_start(self, q: torch.Tensor, frames: torch.Tensor):
+        """P4: with probability dr.reset_oem_prob an episode starting in the first dr.reset_oem_frames frames of its clip starts from a
+        factory-WalkRun standing joint pose (random member of dr.reset_oem_poses + noise) while the reference is still the SSB start."""
+        c = self.spec.dr
+        if c.reset_oem_prob <= 0 or not c.reset_oem_poses or not self.reset_noise:
+            return q, torch.zeros(q.shape[0], dtype=torch.bool, device=self.device)
+        if getattr(self, '_oem_poses', None) is None:  # built on the first (eager) reset: no host->device copy inside a graph capture
+            self._oem_poses = torch.tensor(c.reset_oem_poses, device=self.device, dtype=q.dtype)
+        poses = self._oem_poses
+        n = q.shape[0]
+        a, b = (torch.randint(0, len(poses), (n,), device=self.device) for _ in range(2))
+        w = torch.rand(n, 1, device=self.device)
+        pose = w * poses[a] + (1 - w) * poses[b] + torch.randn_like(q) * c.reset_oem_noise
+        early = (frames - self.motion.clip_start[self.motion.clip_id[frames]]) < c.reset_oem_frames
+        use = early & (torch.rand(n, device=self.device) < c.reset_oem_prob)
+        return torch.where(use.unsqueeze(-1), pose, q), use
+
     def reset(self, env_ids: torch.Tensor, frames: torch.Tensor | None = None):
         if len(env_ids) == 0:
             return
@@ -249,6 +269,8 @@ class TrackingSim:
             q = q + torch.empty_like(q).uniform_(-c.reset_joint_pos, c.reset_joint_pos)
             if c.reset_joint_vel > 0:
                 qd = qd + torch.empty_like(qd).uniform_(-c.reset_joint_vel, c.reset_joint_vel)
+        q, oem = self._oem_start(q, frames)
+        p = p - torch.stack([torch.zeros_like(p[:, 0]), torch.zeros_like(p[:, 0]), 0.06 * oem.float()], -1)  # OEM stance is lower than the SSB start
         q = torch.clamp(q, self.mdp.kin.q_lo, self.mdp.kin.q_hi)
         # mjlab's reset clears solver warm-start data and actuator targets, so it runs before the writes
         self.sim.reset(env_ids)
@@ -259,6 +281,7 @@ class TrackingSim:
         self.robot.write_joint_position_to_sim(q, env_ids=env_ids)
         self.robot.write_joint_velocity_to_sim(qd, env_ids=env_ids)
         self.robot.set_joint_position_target(q, env_ids=env_ids)
+        self.prev_target[env_ids] = q
         self.f[env_ids] = frames
         self.ep_step.index_fill_(0, env_ids, 0)  # index_fill_: no host sync (see _dev_scalar)
         self.a_prev.index_fill_(0, env_ids, 0.0)
@@ -293,6 +316,8 @@ class TrackingSim:
             q = q + torch.empty_like(q).uniform_(-c.reset_joint_pos, c.reset_joint_pos)
             if c.reset_joint_vel > 0:
                 qd = qd + torch.empty_like(qd).uniform_(-c.reset_joint_vel, c.reset_joint_vel)
+        q, oem = self._oem_start(q, frames)
+        p = p - torch.stack([torch.zeros_like(p[:, 0]), torch.zeros_like(p[:, 0]), 0.06 * oem.float()], -1)  # OEM stance is lower than the SSB start
         q = torch.clamp(q, self.mdp.kin.q_lo, self.mdp.kin.q_hi)
         # Simulation.reset (solver warm start, controls, ...) of the masked worlds, before the writes
         sim = self.sim
@@ -317,6 +342,7 @@ class TrackingSim:
         qpos[:, idx.joint_q_adr] = torch.where(d1, q, qpos[:, idx.joint_q_adr])
         qvel[:, idx.joint_v_adr] = torch.where(d1, qd, qvel[:, idx.joint_v_adr])
         ed.joint_pos_target.copy_(torch.where(d1, q, ed.joint_pos_target))
+        self.prev_target.copy_(torch.where(d1, q, self.prev_target))
         self.f.copy_(torch.where(d, frames, self.f))
         self.ep_step.masked_fill_(d, 0)
         self.a_prev.masked_fill_(d1, 0.0)
@@ -413,8 +439,13 @@ class TrackingSim:
         a_prev = self.a_prev.clone()
         ep_step = self.ep_step.clone()
         target = self.default_q + xi[:, 1 : 1 + self.J] + self.alpha * a
-        self.robot.set_joint_position_target(target)
-        for _ in range(DECIMATION):
+        use_delay = self.spec.dr.cmd_delay[1] > 0
+        prev_t = self.prev_target.clone() if use_delay else None
+        if not use_delay:
+            self.robot.set_joint_position_target(target)
+        for _sub in range(DECIMATION):
+            if use_delay:  # the first cmd_delay substeps of a control step still track the previous target (a_{t-1})
+                self.robot.set_joint_position_target(torch.where((self.cmd_delay > _sub).unsqueeze(-1), prev_t, target))
             self.scene.write_data_to_sim()
             self.sim.step()
             self.scene.update(PHYSICS_DT)
@@ -449,6 +480,8 @@ class TrackingSim:
         self.f = f1
         self.ep_step = ep_step + 1
         self.a_prev = a.clone()
+        if use_delay:
+            self.prev_target.copy_(target)
         return out
 
     def step_tail(self, out: dict) -> dict:

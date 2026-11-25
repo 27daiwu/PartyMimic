@@ -64,6 +64,20 @@ class DomainRandCfg:
     reset_joint_pos: float = 0.1
     reset_joint_vel: float = 0.0
     """Half-ranges of the offsets from the reference state at episode start."""
+    # ---- P4 opt-in terms (graph-compatible: sampled once per env / per reset, no host sync). All default off. ----
+    pd_gain_startup: tuple[tuple[float, float], tuple[float, float]] | None = None
+    """((kp scale lo, hi), (kd scale lo, hi)): independent per-joint scale of the PD gains, once per env (xi gets kp, kd)."""
+    pd_gain_global: tuple[tuple[float, float], tuple[float, float]] | None = None
+    """((kp lo, hi), (kd lo, hi)): one extra scale shared by all joints of an env (systematic gain mismatch), on top of pd_gain_startup."""
+    cmd_delay: tuple[int, int] = (0, 0)
+    """Per-env command delay in physics substeps (inclusive range, once per env; 1 substep = 5 ms): the first k substeps of a
+    control step still track the previous target. xi gets the delay; the world model sees a_{t-1}."""
+    reset_oem_prob: float = 0.0
+    reset_oem_poses: tuple[tuple[float, ...], ...] = ()
+    reset_oem_frames: int = 25
+    reset_oem_noise: float = 0.03
+    """With this probability an episode that starts in the first reset_oem_frames frames of a clip starts from a joint pose drawn
+    around one of reset_oem_poses (factory-WalkRun standing poses) instead of the reference pose (WalkRun hand-over start)."""
 
 
 def _match(patterns: dict[str, float], names, default: float = 0.0) -> list[float]:
@@ -111,9 +125,11 @@ class XiLayout:
             add("solref", [sum(c.solref_timeconst) / 2, sum(c.solref_dampratio) / 2],
                 [max((c.solref_timeconst[1] - c.solref_timeconst[0]) / 2, 1e-6),
                  max((c.solref_dampratio[1] - c.solref_dampratio[0]) / 2, 1e-6)])  # fmt: skip
-        if c.pd_gain_scale:
+        if c.pd_gain_scale or c.pd_gain_startup is not None:
             add("kp", [1.0] * J, [0.2] * J)
             add("kd", [1.0] * J, [0.5] * J)
+        if c.cmd_delay[1] > 0:
+            add("delay", [c.cmd_delay[1] / 2], [max(c.cmd_delay[1] / 2, 1e-6)])
         if c.armature_range is not None:
             add("armature", [sum(c.armature_range) / 2] * J, [(c.armature_range[1] - c.armature_range[0]) / 2] * J)
         if c.damping_range is not None:
@@ -180,6 +196,10 @@ class DomainRandomizer:
             cfg = SceneEntityCfg("robot", joint_names=(".*",))
             self._terms.append((dr.joint_damping, cfg, dict(ranges=c.damping_range, operation="scale", shared_random=False)))
         fields = {"geom_friction"}
+        self._pd_startup_cfg = None
+        if c.pd_gain_startup is not None:
+            self._pd_startup_cfg = SceneEntityCfg("robot", actuator_ids=list(range(len(ent.actuators))))
+            fields.update(dr.pd_gains.model_fields)
         if c.com_mass_range is None and not eval_mode:
             fields.add("body_ipos")
         if c.wrist_payload > 0:
@@ -192,6 +212,8 @@ class DomainRandomizer:
         for func, cfg, _ in self._terms:
             cfg.resolve(env.scene)
             fields.update(func.model_fields)
+        if self._pd_startup_cfg is not None:
+            self._pd_startup_cfg.resolve(env.scene)
         self.recompute = max((func.recompute for func, _, _ in self._terms), default=RecomputeLevel.none)
         sim.expand_model_fields(tuple(sorted(fields)))
 
@@ -212,6 +234,27 @@ class DomainRandomizer:
         for name in ("link_mass", "kp", "kd", "armature", "damping"):
             if name in self.layout.slices:
                 xi[:, self.layout.slices[name]] = 1.0
+        if c.pd_gain_startup is not None and not self.eval_mode:
+            env = self.env
+            dr.pd_gains(env, None, asset_cfg=self._pd_startup_cfg, kp_range=c.pd_gain_startup[0], kd_range=c.pd_gain_startup[1], operation="scale")
+            if c.pd_gain_global is not None:
+                gk = torch.empty(N, 1, device=dev).uniform_(*c.pd_gain_global[0]); gd = torch.empty(N, 1, device=dev).uniform_(*c.pd_gain_global[1])
+                for act in env.robot.actuators:
+                    ids = act.global_ctrl_ids
+                    sim.model.actuator_gainprm[:, ids, 0] = sim.model.actuator_gainprm[:, ids, 0] * gk
+                    sim.model.actuator_biasprm[:, ids, 1] = sim.model.actuator_biasprm[:, ids, 1] * gk
+                    sim.model.actuator_biasprm[:, ids, 2] = sim.model.actuator_biasprm[:, ids, 2] * gd
+            kp = torch.ones(N, self.J, device=dev); kd = torch.ones(N, self.J, device=dev)
+            dg, db = sim.get_default_field("actuator_gainprm"), sim.get_default_field("actuator_biasprm")
+            for act in env.robot.actuators:  # BuiltinPositionActuator: kp = gainprm[0] (= -biasprm[1]), kd = -biasprm[2]
+                ids = act.global_ctrl_ids
+                kp[:, act.target_ids] = sim.model.actuator_gainprm[:, ids, 0] / dg[ids, 0]
+                kd[:, act.target_ids] = sim.model.actuator_biasprm[:, ids, 2] / db[ids, 2]
+            xi[:, self.layout.slices["kp"]], xi[:, self.layout.slices["kd"]] = kp, kd
+        if "delay" in self.layout.slices:
+            k = torch.zeros(N, device=dev) if self.eval_mode else torch.randint(c.cmd_delay[0], c.cmd_delay[1] + 1, (N,), device=dev).float()
+            self.env.cmd_delay = k.long()
+            xi[:, self.layout.slices["delay"]] = k.unsqueeze(-1)
         if "solref" in self.layout.slices:
             xi[:, self.layout.slices["solref"]] = sim.get_default_field("geom_solref")[self.solref_geoms[0]]
         if "qd_tau_scale" in self.layout.slices:

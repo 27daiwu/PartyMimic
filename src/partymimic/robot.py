@@ -73,7 +73,7 @@ class RobotSpec:
     def has_action_delay(self) -> bool:
         """Whether any actuator delays its command (then s_{t+1} also depends on a_{t-1})."""
         art = self.robot_cfg().articulation
-        return art is not None and any(act.delay_max_lag > 0 for act in art.actuators)
+        return (art is not None and any(act.delay_max_lag > 0 for act in art.actuators)) or self.dr.cmd_delay[1] > 0
 
 
 def get_robot(name: str) -> RobotSpec:
