@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$HERE/pipeline:$HERE/src" exec "$HERE/.venv/bin/python" -m unittest discover -s "$HERE/pipeline/tests" -v "$@"

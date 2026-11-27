@@ -13,6 +13,6 @@ struct HandbackReport {
 
 // Blocks until the outcome is final (confirmed / settled on the PASSIVE fallback / unconfirmed after the hold time).
 HandbackReport handback(Link& link, const ExitRequest& req, const ExitConfig& cfg, ExitExecutor::FrameFn frames, ExitExecutor::PhaseFn phase = nullptr,
-                        ExitExecutor::RemodeFn remode = nullptr, ExitExecutor::EmergencyFn emergency = nullptr);
+                        ExitExecutor::RemodeFn remode = nullptr, ExitExecutor::EmergencyFn emergency = nullptr, ExitExecutor::LogFn log = nullptr);
 
 }  // namespace pm

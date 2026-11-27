@@ -1,0 +1,35 @@
+# 评估/筛选配置 balance_first_v1：动态平衡优先，还原度其次
+name: balance_first_v1
+periodic:                   # 训练期间评估守护进程：每个 checkpoint 一次（固定工况网格、固定种子，独立于训练的随机化）
+  every: 2000
+  also: [500, 1000]         # 额外评估的早期迭代（短程闸门用）
+  reps: 8
+  seed: 1234
+hard:                       # 训练结束后对候选的“硬复评”：不同种子、更多重复、超出训练分布的工况
+  reps: 24
+  seed: 777
+  top_balance: 3            # 候选 = 周期评估中 balance 前 N + fidelity 前 N + combined 前 N + 最后一个
+  top_fidelity: 2
+  top_combined: 3
+selection:                  # 最终模型规则（硬复评结果上）
+  eligible:
+    nominal_survival_min: 1.0     # 标称工况必须 100% 存活
+    robust_survival_min: 0.90     # 扰动/随机化工况存活率下限
+  primary: balance_first
+  balance_tolerance: 2.0          # 平衡分在最优的 2 分以内视为同档 → 同档内取还原度（fidelity）最高者
+short_gate:                 # 短程闸门（run 在训练 gate_iters 轮后检查；失败则不继续长训）
+  iters: 2000
+sim2sim:                    # 部署链闭环（C++ guard 等价 + 200Hz PD, MuJoCo, 真机 WalkRun 站姿初态）
+  # 初态口径（V1.2 更正）：eval_bench.sample_inits(n) = 10 个真机站姿(5 个 ready.json + 5 个首 tick) + n 个插值采样 => 每工况实际 n+10 个初态。
+  # V1.0/V1.1 的文案把它写成“14 初态”，实际是 24。`n` 保持原含义 = 采样数（CLI --n 同义）；下面三项只是显式声明，供一致性校验（total 必须 = real_poses + sampled）。
+  n: 14                     # = sampled（向后兼容的旧字段）
+  real_poses: 10
+  sampled: 14
+  total: 24
+  conds: [nominal, delay5, delay10, delay15, delay20, fric0.6, fric1.2, kp0.8, kp0.85, kp1.15, kp1.2, push_f, push_b, push_l, noise]
+  gate:
+    nominal_success_min: 0.95
+    core_conds: [delay5, delay10, fric0.6, fric1.2, kp0.85, kp1.15, push_f, push_b]
+    core_success_min: 0.80        # 每个核心工况
+    mean_success_min: 0.90        # 全部工况均值
+  max_candidates: 3               # 主选 Sim2Sim 失败时，按规则依次尝试的候选数

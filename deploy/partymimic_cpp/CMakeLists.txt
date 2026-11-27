@@ -45,7 +45,7 @@ set(CMAKE_BUILD_RPATH "${ORT_LIB_DIR};/usr/local/lib")
 set(CMAKE_INSTALL_RPATH "${ORT_LIB_DIR};/usr/local/lib")
 
 # ---- policy core: Eigen + ONNX Runtime only (no robot SDK)
-add_library(pm_policy STATIC src/util.cpp src/policy.cpp src/fk.cpp)
+add_library(pm_policy STATIC src/util.cpp src/policy.cpp src/fk.cpp src/runlog.cpp)
 target_include_directories(pm_policy PUBLIC include ${EIGEN3_INCLUDE_DIR} ${ORT_INCLUDE_DIR})
 target_link_libraries(pm_policy PUBLIC ${ORT_LIB} Threads::Threads)
 
@@ -59,7 +59,7 @@ foreach(d ${DDSC_INCLUDE_DIR} ${ICEORYX_INCLUDE_DIR})
 endforeach()
 target_link_libraries(pm_robot PUBLIC pm_policy ${SDK2_LIB} ${DDSCXX_LIB} ${DDSC_LIB} rt Threads::Threads)
 
-add_executable(partymimic src/main.cpp src/runner.cpp src/guardian.cpp src/service.cpp src/selfcheck.cpp)
+add_executable(partymimic src/main.cpp src/runner.cpp src/guardian.cpp src/service.cpp src/selfcheck.cpp src/logtool.cpp)
 target_link_libraries(partymimic PRIVATE pm_robot)
 
 # development-only checks (not part of the robot package)

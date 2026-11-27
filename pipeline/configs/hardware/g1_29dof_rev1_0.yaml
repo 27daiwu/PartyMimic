@@ -1,0 +1,273 @@
+# Hardware profile g1_29dof_rev1_0 - SINGLE SOURCE OF TRUTH for G1 29-DoF Rev 1.0 joint limits.
+# Generated from the official URDF by `./pm hwaudit --write-profile` (pmpipe/hwaudit.py); do not edit numbers by hand,
+# regenerate. The unit test checks every number against the URDF and the recorded sha256.
+profile: g1_29dof_rev1_0
+version: 1.2.0
+generated: '2026-11-26 12:31:03'
+robot: Unitree G1 29-DoF, Rev 1.0
+urdf:
+  path: data/g1_description/g1_29dof_rev_1_0.urdf
+  robot_name: g1_29dof_rev_1_0
+  sha256: 824ce02c2c1e489aa8dece47a10fe02d1872289c0e6d01ba51abd291e66b7b2c
+  tag: <limit effort velocity lower upper> of every non-fixed joint
+policy_joint_order_source: deploy/partymimic_cpp/assets/policy_params.txt (joint_names)
+mode_machine:
+  value_used_by_deployment: 5
+  meaning: Machine / DoF-configuration identifier carried in the HG LowState_/LowCmd_ (uint8). The official demo (g1_mimic_demo/deploy_template/main.cpp:43) writes 5 with the comment '29dof'; check_mode_machine()
+    (g1_pub.h:52-60) accepts 0 (simulation) or a value equal to the one in LowState. Source IDL / examples give NO table of other values, so only 0 = simulation and 5 = G1 29-DoF are documented.
+  does_not_change_joint_limits: No official source found that makes effort / velocity / position limits depend on mode_machine; the limits below are per-URDF (Rev 1.0, 29 DoF).
+  related_but_different:
+    mode_pr: 'LowCmd_.mode_pr: 0 = PR ''series control for pitch/roll joints'', 1 = AB ''parallel control for A/B joints'' (py_g1_low_level_example.py:72-75). It decides how the ANKLE command (and the waist
+      pitch/roll pair) is interpreted: joint space (pitch/roll) vs. motor space (A/B). The deployment and sim2real real_bridge use mode_pr=0 (PR), so all limits here are joint-space limits.'
+    sim2real_mode_13_15: '''g1-mode_13_15.xml'' / `G1_MODE_15_JOINT_ARMATURE` in sim2real g1.py are simulation-model names (reflected armature of the parallel ankle/waist = 2 x 5020 motors); undocumented,
+      NOT shown to be related to LowCmd_.mode_machine.'
+  other_variants_not_covered: G1 23-DoF (waist locked, wrists 'INVALID') and G1+ are different machines; the audit rejects them as targets (OFFICIAL_FRAMEWORK_AUDIT F13).
+  evidence:
+  - sim2real_party_p0_patched/scripts/g1/real_bridge.py:131 (mode_machine = 5, mode_pr = 0)
+  - results/p3_1/vendor/unitree-app-templates/g1_mimic_demo/deploy_template/main.cpp:43-44
+  - results/p3_1/vendor/unitree-app-templates/g1_mimic_demo/deploy_template/include/unitree/dds_wrapper/robots/g1/g1_pub.h:52-60
+  - results/p3/official/sources/py_g1_low_level_example.py.txt:72-75,137,173
+  - results/p3_1/reports/OFFICIAL_FRAMEWORK_AUDIT.md F13
+  - deploy/partymimic_cpp/src/link.cpp:168-169, session.cpp:217 (expects 5)
+other_official_source:
+  path: data/g1_description/g1_29dof.xml
+  note: 'official MJCF of the same Rev 1.0 robot: actuatorfrcrange hip_roll ±139, hip_yaw ±88 (agrees with the URDF)'
+user_claim_check:
+  claim: Rev 1.0 hip roll = 139 N.m, 20 rad/s
+  urdf_hip_roll:
+    effort: 139.0
+    velocity: 20.0
+  verdict: 'CONFIRMED by the URDF (left and right hip roll: effort 139, velocity 20); the knee has the same 139 N.m / 20 rad/s'
+joints:
+- index: 0
+  name: left_hip_pitch_joint
+  group: leg
+  effort_nm: 88.0
+  velocity_rad_s: 32.0
+  lower_rad: -2.5307
+  upper_rad: 2.8798
+  source: urdf:L79
+- index: 1
+  name: left_hip_roll_joint
+  group: leg
+  effort_nm: 139.0
+  velocity_rad_s: 20.0
+  lower_rad: -0.5236
+  upper_rad: 2.9671
+  source: urdf:L108
+- index: 2
+  name: left_hip_yaw_joint
+  group: leg
+  effort_nm: 88.0
+  velocity_rad_s: 32.0
+  lower_rad: -2.7576
+  upper_rad: 2.7576
+  source: urdf:L137
+- index: 3
+  name: left_knee_joint
+  group: leg
+  effort_nm: 139.0
+  velocity_rad_s: 20.0
+  lower_rad: -0.087267
+  upper_rad: 2.8798
+  source: urdf:L166
+- index: 4
+  name: left_ankle_pitch_joint
+  group: ankle(parallel)
+  effort_nm: 50.0
+  velocity_rad_s: 37.0
+  lower_rad: -0.87267
+  upper_rad: 0.5236
+  source: urdf:L195
+- index: 5
+  name: left_ankle_roll_joint
+  group: ankle(parallel)
+  effort_nm: 50.0
+  velocity_rad_s: 37.0
+  lower_rad: -0.2618
+  upper_rad: 0.2618
+  source: urdf:L242
+- index: 6
+  name: right_hip_pitch_joint
+  group: leg
+  effort_nm: 88.0
+  velocity_rad_s: 32.0
+  lower_rad: -2.5307
+  upper_rad: 2.8798
+  source: urdf:L271
+- index: 7
+  name: right_hip_roll_joint
+  group: leg
+  effort_nm: 139.0
+  velocity_rad_s: 20.0
+  lower_rad: -2.9671
+  upper_rad: 0.5236
+  source: urdf:L300
+- index: 8
+  name: right_hip_yaw_joint
+  group: leg
+  effort_nm: 88.0
+  velocity_rad_s: 32.0
+  lower_rad: -2.7576
+  upper_rad: 2.7576
+  source: urdf:L329
+- index: 9
+  name: right_knee_joint
+  group: leg
+  effort_nm: 139.0
+  velocity_rad_s: 20.0
+  lower_rad: -0.087267
+  upper_rad: 2.8798
+  source: urdf:L358
+- index: 10
+  name: right_ankle_pitch_joint
+  group: ankle(parallel)
+  effort_nm: 50.0
+  velocity_rad_s: 37.0
+  lower_rad: -0.87267
+  upper_rad: 0.5236
+  source: urdf:L387
+- index: 11
+  name: right_ankle_roll_joint
+  group: ankle(parallel)
+  effort_nm: 50.0
+  velocity_rad_s: 37.0
+  lower_rad: -0.2618
+  upper_rad: 0.2618
+  source: urdf:L434
+- index: 12
+  name: waist_yaw_joint
+  group: waist
+  effort_nm: 88.0
+  velocity_rad_s: 32.0
+  lower_rad: -2.618
+  upper_rad: 2.618
+  source: urdf:L459
+- index: 13
+  name: waist_roll_joint
+  group: waist(parallel)
+  effort_nm: 50.0
+  velocity_rad_s: 37.0
+  lower_rad: -0.52
+  upper_rad: 0.52
+  source: urdf:L482
+- index: 14
+  name: waist_pitch_joint
+  group: waist(parallel)
+  effort_nm: 50.0
+  velocity_rad_s: 37.0
+  lower_rad: -0.52
+  upper_rad: 0.52
+  source: urdf:L511
+- index: 15
+  name: left_shoulder_pitch_joint
+  group: arm
+  effort_nm: 25.0
+  velocity_rad_s: 37.0
+  lower_rad: -3.0892
+  upper_rad: 2.6704
+  source: urdf:L632
+- index: 16
+  name: left_shoulder_roll_joint
+  group: arm
+  effort_nm: 25.0
+  velocity_rad_s: 37.0
+  lower_rad: -1.5882
+  upper_rad: 2.2515
+  source: urdf:L661
+- index: 17
+  name: left_shoulder_yaw_joint
+  group: arm
+  effort_nm: 25.0
+  velocity_rad_s: 37.0
+  lower_rad: -2.618
+  upper_rad: 2.618
+  source: urdf:L690
+- index: 18
+  name: left_elbow_joint
+  group: arm
+  effort_nm: 25.0
+  velocity_rad_s: 37.0
+  lower_rad: -1.0472
+  upper_rad: 2.0944
+  source: urdf:L719
+- index: 19
+  name: left_wrist_roll_joint
+  group: arm
+  effort_nm: 25.0
+  velocity_rad_s: 37.0
+  lower_rad: -1.972222054
+  upper_rad: 1.972222054
+  source: urdf:L726
+- index: 20
+  name: left_wrist_pitch_joint
+  group: wrist
+  effort_nm: 5.0
+  velocity_rad_s: 22.0
+  lower_rad: -1.614429558
+  upper_rad: 1.614429558
+  source: urdf:L755
+- index: 21
+  name: left_wrist_yaw_joint
+  group: wrist
+  effort_nm: 5.0
+  velocity_rad_s: 22.0
+  lower_rad: -1.614429558
+  upper_rad: 1.614429558
+  source: urdf:L784
+- index: 22
+  name: right_shoulder_pitch_joint
+  group: arm
+  effort_nm: 25.0
+  velocity_rad_s: 37.0
+  lower_rad: -3.0892
+  upper_rad: 2.6704
+  source: urdf:L856
+- index: 23
+  name: right_shoulder_roll_joint
+  group: arm
+  effort_nm: 25.0
+  velocity_rad_s: 37.0
+  lower_rad: -2.2515
+  upper_rad: 1.5882
+  source: urdf:L885
+- index: 24
+  name: right_shoulder_yaw_joint
+  group: arm
+  effort_nm: 25.0
+  velocity_rad_s: 37.0
+  lower_rad: -2.618
+  upper_rad: 2.618
+  source: urdf:L914
+- index: 25
+  name: right_elbow_joint
+  group: arm
+  effort_nm: 25.0
+  velocity_rad_s: 37.0
+  lower_rad: -1.0472
+  upper_rad: 2.0944
+  source: urdf:L943
+- index: 26
+  name: right_wrist_roll_joint
+  group: arm
+  effort_nm: 25.0
+  velocity_rad_s: 37.0
+  lower_rad: -1.972222054
+  upper_rad: 1.972222054
+  source: urdf:L950
+- index: 27
+  name: right_wrist_pitch_joint
+  group: wrist
+  effort_nm: 5.0
+  velocity_rad_s: 22.0
+  lower_rad: -1.614429558
+  upper_rad: 1.614429558
+  source: urdf:L979
+- index: 28
+  name: right_wrist_yaw_joint
+  group: wrist
+  effort_nm: 5.0
+  velocity_rad_s: 22.0
+  lower_rad: -1.614429558
+  upper_rad: 1.614429558
+  source: urdf:L1008

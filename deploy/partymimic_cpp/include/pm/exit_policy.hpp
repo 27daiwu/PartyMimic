@@ -8,6 +8,7 @@
 #pragma once
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <condition_variable>
 #include <deque>
 #include <functional>
@@ -31,6 +32,16 @@ struct ExitConfig {
   double unstable_gyro_rad_s = 8.0;       // |gyro_xy| (roll/pitch rate) criterion
   double unstable_tilt_rate_rad_s = 3.0;  // d(tilt)/dt criterion (0 = off)
   int unstable_debounce_samples = 2;      // consecutive DISTINCT lowstate samples that must agree
+  // ---- V1.6 A1: reference-aware instability (the DIY dance itself leans the pelvis to 0.50 rad; a fixed 0.40 tilt limit fired on the dance, not on a fall).
+  //   While a VALID, fresh reference is available the fixed `unstable_tilt_rad` is replaced by "the robot's gravity direction deviates from the REFERENCE pelvis gravity direction"
+  //   (angle between the measured and the reference gravity vector in the pelvis frame = yaw-free):  dev > ref_dev_rad  AND tilt > ref_dev_min_tilt_rad  AND d(dev)/dt >= ref_dev_growth_rad_s.
+  //   No valid reference (lead-in / paused / hold / missing / NaN / stale) -> the old fixed unstable_tilt_rad. The absolute caps below never depend on the reference.
+  bool ref_aware = true;                  // false = legacy behaviour (fixed unstable_tilt_rad only)
+  double unstable_hard_tilt_rad = 0.70;   // ABSOLUTE hard cap, independent of the reference (and of its validity): above -> UNSTABLE (WalkRun). Must stay above the reference's own maximum lean (0.50 for DIY) + margin
+  double ref_dev_rad = 0.35;              // gravity-direction error vs the reference that counts as "not following the reference"
+  double ref_dev_min_tilt_rad = 0.25;     // ... and the absolute tilt must also be at least this (a small robot tilt is never "unstable" just because the reference is upright)
+  double ref_dev_growth_rad_s = 0.0;      // ... and the error must not be shrinking: d(dev)/dt (40 ms window) >= this. -2 = off
+  double ref_max_age_s = 0.15;            // a reference older than this (control loop stalled) counts as invalid -> fallback to the fixed limit
   double attitude_max_age_s = 0.10;       // older attitude = unknown = PASSIVE
   // ---- remote controller
   double l2b_hold_s = 0.10;               // L2+B must be held this long (and re-pressed after control started) -> emergency PASSIVE
@@ -59,21 +70,66 @@ Attitude attitude_of(const StatePtr& st, double now_mono, double max_age_s);
 
 // ---------------------------------------------------------------- stability detector
 enum class Stability { OK, UNSTABLE, FALLEN };
+
+// V1.6 A1: the reference's attitude as the monitor needs it (gravity direction in the pelvis frame; yaw-free), published by the 50 Hz control loop, read by the 3 ms watch thread.
+struct RefAttitude {
+  bool valid = false;             // runner says the reference is running (dance, not lead-in / paused / hold) AND the quaternion is finite & normalised
+  double g[3] = {0, 0, -1};       // unit gravity direction expressed in the reference pelvis frame
+  double tilt = 0;                // angle between reference pelvis z and world z
+  double t_set = 0;               // mono() when published
+  uint64_t tick = 0;
+};
+class RefChannel {
+ public:
+  void set(bool valid, const std::array<float, 4>& q_wxyz, double t_mono, uint64_t tick);   // control loop, once per tick (valid=false: reference not usable)
+  void invalidate(double t_mono) { std::lock_guard<std::mutex> lk(m_); r_.valid = false; r_.t_set = t_mono; }
+  RefAttitude get() const { std::lock_guard<std::mutex> lk(m_); return r_; }
+ private:
+  mutable std::mutex m_;
+  RefAttitude r_;
+};
+void gravity_of_quat(const std::array<double, 4>& q, double g[3]);  // unit gravity direction in the body frame (wxyz body->world quaternion); NaN if unusable
+
+// which rule made a sample "unstable" (priority order)
+enum class TiltRule { NONE, FALLEN, HARD, REF_DEV, ABS_RATE, LIMIT };
+const char* tilt_rule_name(TiltRule r);
+struct TiltTrigger {  // everything the next log needs at a glance
+  TiltRule rule = TiltRule::NONE;
+  bool ref_used = false;           // a valid fresh reference was in force at that sample
+  double tilt = 0, ref_tilt = NAN, dev = NAN, dev_rate = NAN, gyro_xy = 0, tilt_rate = 0, ref_age_s = NAN, arrival = 0;
+};
+
 class StabilityMonitor {
  public:
-  explicit StabilityMonitor(const ExitConfig& c = ExitConfig()) : c_(c) {}
+  explicit StabilityMonitor(const ExitConfig& c = ExitConfig(), const RefChannel* ref = nullptr, const char* name = "monitor") : c_(c), ref_(ref), name_(name) {}
   Stability update(const LinkState& st);  // call with every state; duplicates (same seq) are ignored
   Stability level() const { return level_; }
   const std::string& detail() const { return detail_; }
+  const TiltTrigger& trigger() const { return trig_; }          // the sample that made the level non-OK (valid once level() != OK)
+  std::string trigger_json() const;                              // structured version of detail(): rule, measured/reference tilt, gravity error, every limit (events.jsonl `tilt_judge_trigger`)
   double tilt = 0, gyro_xy = 0, tilt_rate = 0;
+  double max_tilt = 0, max_gyro_xy = 0;  // P5.3: extremes over EVERY sample this monitor saw (including the one that triggered the exit, which never becomes a trace row)
+  // V1.6 A1 statistics (run_report.json tilt_judge): over every sample this monitor saw
+  double dev = NAN, ref_tilt = NAN, dev_rate = 0;               // current
+  bool ref_used = false;
+  long n_samples = 0, n_ref_used = 0;
+  double max_dev = 0, max_ref_tilt = 0, max_excess = -10;       // max gravity error / reference tilt / (tilt - reference tilt) while a valid reference was used
+  double min_margin_dev = 1e9;                                   // min of (ref_dev_rad - dev) while the reference was used AND tilt > ref_dev_min_tilt_rad (<0 = would have tripped, ignoring growth/debounce)
+  double min_margin_hard = 1e9;                                  // min of (unstable_hard_tilt_rad - tilt), every sample
+  double min_margin_limit = 1e9;                                 // min of (unstable_tilt_rad - tilt) while NO valid reference (the old fixed limit)
  private:
   ExitConfig c_;
+  const RefChannel* ref_;
+  std::string name_;
   uint64_t last_seq_ = ~0ull;
   int n_unstable_ = 0, n_fallen_ = 0;
   Stability level_ = Stability::OK;
   std::string detail_;
-  std::deque<std::pair<double, double>> hist_;  // (arrival, tilt)
+  TiltTrigger trig_;
+  std::deque<std::pair<double, double>> hist_;   // (arrival, tilt)
+  std::deque<std::pair<double, double>> dhist_;  // (arrival, gravity error vs reference)
 };
+std::string tilt_judge_json(const ExitConfig& c, const StabilityMonitor& a, const StabilityMonitor& b);  // config + merged statistics of the two monitors (run_report.json / manifest)
 
 // ---------------------------------------------------------------- decision
 struct ExitContext {
@@ -101,6 +157,7 @@ struct ExitRequest {
   bool precheck = false;           // GetFsmId before the RPC (only when the user fsm was never confirmed / control may already be back)
   double t_detect = 0;             // mono() when the decision was made
   double t_event = 0;              // mono() arrival of the state sample that showed the problem (0 = unknown)
+  Attitude att;                    // P5.1: attitude the decision was made from (for the run report)
 };
 
 struct ExitVerdict {
@@ -121,6 +178,8 @@ struct ExitOutcome {
   double t_detect = 0, t_event = 0, t_rpc_sent = 0, t_rpc_returned = 0, t_fsm_confirmed = 0, t_stable_confirmed = 0, t_done = 0;
   std::string note, confirmed_via, escalation_why;
   std::vector<std::pair<double, int>> fsm_trace;  // (mono, fsm) at every change; -1 = unreadable
+  Attitude att_rpc_sent, att_confirmed;            // P5.1: attitude when the first exit RPC went out / when the requested FSM was first seen
+  double t_frames_stopped = 0;                     // mono() when the HOLD/DAMP frames were switched off (OEM took over)
   ExitVerdict verdict;
 };
 ExitVerdict classify_exit(const ExitRequest& req, const ExitOutcome& o);
@@ -138,6 +197,8 @@ class ExitExecutor {
   void start();                                // spawns the two idle threads (call before control is taken: thread creation is not on the critical path)
   bool submit(const ExitRequest& req);         // first call wins (false = already submitted). Wakes the RPC thread FIRST, then sends the first frame.
   bool submitted() const { return state_.load() != 0; }
+  using LogFn = std::function<void(const std::string& kind, const std::string& fields_json)>;
+  void set_log(LogFn f) { log_ = std::move(f); }  // P5.1: fine-grained exit events (submit, rpc attempts, match, stable, escalation, result)
   void escalate_passive(const std::string& why);  // emergency during/after submit: damp frames + PASSIVE request as soon as the current RPC returns
   bool wait(double timeout_s);                 // true when the outcome is final
   bool done() const { return state_.load() == 2; }
@@ -172,6 +233,8 @@ class ExitExecutor {
   std::string mode_;  // current requested mode (may change WALKRUN -> PASSIVE)
   bool started_ = false;
   std::mutex trace_m_;
+  LogFn log_;
+  void lg(const std::string& kind, const std::string& fields = "") { if (log_) { try { log_(kind, fields); } catch (...) {} } }
 };
 
 }  // namespace pm

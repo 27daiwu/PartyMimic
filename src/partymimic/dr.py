@@ -78,6 +78,15 @@ class DomainRandCfg:
     reset_oem_noise: float = 0.03
     """With this probability an episode that starts in the first reset_oem_frames frames of a clip starts from a joint pose drawn
     around one of reset_oem_poses (factory-WalkRun standing poses) instead of the reference pose (WalkRun hand-over start)."""
+    # ---- YTHN opt-in terms (all default off; sampled once per env at startup, graph-compatible) ----
+    effort_scale: tuple[float, float] | None = None
+    """Per-joint, per-env scale of the actuator torque limit (actuatorfrcrange), once per env; xi gets it. Trains against the
+    torque saturation of the real drive (a policy that leans on the full 50 Nm ankle saturation falls when it is not there)."""
+    mass_scale: tuple[float, float] | None = None
+    """One scale of every body mass (and inertia) of the robot per env (battery / cable / payload mismatch); xi gets it."""
+    target_clip: float | None = None
+    """Deployment-guard semantics: the PD target is clamped to [hard lo + margin, hard hi - margin] (rad) before it reaches the
+    actuator, as the C++ runner's guard does (None: the policy's target is passed through unclamped, as in training so far)."""
 
 
 def _match(patterns: dict[str, float], names, default: float = 0.0) -> list[float]:
@@ -130,6 +139,10 @@ class XiLayout:
             add("kd", [1.0] * J, [0.5] * J)
         if c.cmd_delay[1] > 0:
             add("delay", [c.cmd_delay[1] / 2], [max(c.cmd_delay[1] / 2, 1e-6)])
+        if c.effort_scale is not None:
+            add("effort", [sum(c.effort_scale) / 2] * J, [max((c.effort_scale[1] - c.effort_scale[0]) / 2, 1e-6)] * J)
+        if c.mass_scale is not None:
+            add("mass", [sum(c.mass_scale) / 2], [max((c.mass_scale[1] - c.mass_scale[0]) / 2, 1e-6)])
         if c.armature_range is not None:
             add("armature", [sum(c.armature_range) / 2] * J, [(c.armature_range[1] - c.armature_range[0]) / 2] * J)
         if c.damping_range is not None:
@@ -209,6 +222,10 @@ class DomainRandomizer:
             fields.add("body_mass")
         if c.solref_geoms is not None:
             fields.add("geom_solref")
+        if c.effort_scale is not None:
+            fields.add("actuator_forcerange")
+        if c.mass_scale is not None:
+            fields.update(("body_mass", "body_inertia"))
         for func, cfg, _ in self._terms:
             cfg.resolve(env.scene)
             fields.update(func.model_fields)
@@ -259,13 +276,30 @@ class DomainRandomizer:
             xi[:, self.layout.slices["solref"]] = sim.get_default_field("geom_solref")[self.solref_geoms[0]]
         if "qd_tau_scale" in self.layout.slices:
             xi[:, self.layout.slices["qd_tau_scale"]] = 1.0
+        mass_scale = None
+        if "mass" in self.layout.slices:
+            mass_scale = torch.ones(N, 1, device=dev) if self.eval_mode else torch.empty(N, 1, device=dev).uniform_(*c.mass_scale)
+            xi[:, self.layout.slices["mass"]] = mass_scale
+            dm, di = sim.get_default_field("body_mass"), sim.get_default_field("body_inertia")
+            sim.model.body_mass[:] = dm.unsqueeze(0) * mass_scale
+            sim.model.body_inertia[:] = di.unsqueeze(0) * mass_scale.unsqueeze(-1)
+            sim.recompute_constants(RecomputeLevel.set_const)
+        if "effort" in self.layout.slices:
+            es = torch.ones(N, self.J, device=dev) if self.eval_mode else torch.empty(N, self.J, device=dev).uniform_(*c.effort_scale)
+            xi[:, self.layout.slices["effort"]] = es
+            dfr = sim.get_default_field("actuator_forcerange")
+            for act in self.env.robot.actuators:  # one position actuator per joint (ctrl id == target id order)
+                ids = act.global_ctrl_ids
+                sim.model.actuator_forcerange[:, ids, 0] = dfr[ids, 0] * es[:, act.target_ids]
+                sim.model.actuator_forcerange[:, ids, 1] = dfr[ids, 1] * es[:, act.target_ids]
         if "payload" in self.layout.slices:
             kg = torch.zeros(N, 2, device=dev)
             if not self.eval_mode:
                 kg = torch.rand(N, 2, device=dev) * c.wrist_payload * (torch.rand(N, 1, device=dev) >= c.payload_p0)
             xi[:, self.layout.slices["payload"]] = kg
             b = self.wrist_body_ids
-            sim.model.body_mass[:, b] = sim.get_default_field("body_mass")[b] + kg
+            base = sim.get_default_field("body_mass")[b] if mass_scale is None else sim.get_default_field("body_mass")[b] * mass_scale
+            sim.model.body_mass[:, b] = base + kg
             sim.recompute_constants(RecomputeLevel.set_const)
 
     # ------------------------------------------------------------------ per episode

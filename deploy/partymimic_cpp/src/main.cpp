@@ -4,9 +4,14 @@
 //   partymimic guardian  independent watchdog process (takes over if the runner dies / hangs)
 //   partymimic release   operator hand-back of a robot stuck in user control
 //   partymimic selfcheck offline checks (no robot connection)
+//   partymimic logtool   offline log tools: finalize (salvage run_report after a crash) | check (integrity) | replay (bit-exact policy replay of obs.bin)
 #include <unistd.h>
 
 #include <climits>
+#include <sys/utsname.h>
+
+#include "pm/frozen.hpp"
+#include "pm/version.hpp"
 #include <cstdio>
 #include <cstring>
 
@@ -50,12 +55,19 @@ std::vector<std::string> guardian_cmdline(const GuardianCmd& c) {
 std::vector<std::string> runner_cmdline(const RunnerCmd& c) {
   std::vector<std::string> a = {c.self, "runner", "--iface", c.iface, "--domain", std::to_string(c.domain), "--run-s", std::to_string(c.run_s), "--ref-mode", c.ref_mode, "--authority-max", std::to_string(c.authority),
                                 "--ramp-s", std::to_string(c.ramp_s), "--end-hold-s", std::to_string(c.end_hold_s),
-                                "--run-dir", c.run_dir, "--wait-go", c.go_file, "--status-file", c.status_file, "--ready-timeout-s", std::to_string(c.ready_timeout_s)};
+                                "--wait-go", c.go_file, "--status-file", c.status_file};
+  if (c.standby) { a.push_back("--standby"); a.push_back("--trigger-file"); a.push_back(c.trigger_file); }  // V1.5.1: pre-warmed runner; the run directory arrives with the trigger
+  else { a.push_back("--run-dir"); a.push_back(c.run_dir); }
   if (c.allow_partial) a.push_back("--allow-partial-authority");
-  if (c.accept_unvalidated) a.push_back("--accept-unvalidated");
+  if (c.check_only) a.push_back("--check-only");
+  if (c.torque_ff) a.push_back("--torque-ff");
+  if (c.no_torque_ff) a.push_back("--no-torque-ff");
   if (!c.entry_fsm.empty()) { a.push_back("--entry-fsm"); a.push_back(c.entry_fsm); }
+  if (!c.mode_name.empty()) { a.push_back("--mode"); a.push_back(c.mode_name); }
+  if (!c.announced_file.empty()) { a.push_back("--announced-file"); a.push_back(c.announced_file); }  // V1.6: the service reports "announcement finished" through this file
+  if (!c.announce_wait_s.empty()) { a.push_back("--announce-wait-s"); a.push_back(c.announce_wait_s); }
   if (!c.unconfirmed_hold_s.empty()) { a.push_back("--unconfirmed-hold-s"); a.push_back(c.unconfirmed_hold_s); }
-  a.push_back(c.sim ? "--sim" : "--i-confirm-protection");
+  if (c.sim) a.push_back("--sim");
   return a;
 }
 
@@ -85,6 +97,17 @@ Site Site::load(const std::string& path) {
   s.allow_partial_authority = kv.num("allow_partial_authority", 0) != 0;
   s.tts = kv.num("tts", 1) != 0;
   s.tts_volume = (int)kv.num("tts_volume", 100);
+  s.lead_in_s = kv.num("lead_in_s", s.lead_in_s);
+  s.settle_stable_s = kv.num("settle_stable_s", s.settle_stable_s);
+  s.settle_timeout_s = kv.num("settle_timeout_s", s.settle_timeout_s);
+  s.log_preroll_s = kv.num("log_preroll_s", s.log_preroll_s);
+  s.log_post_exit_s = kv.num("log_post_exit_s", s.log_post_exit_s);
+  s.log_obs = kv.num("log_obs", 1) != 0;
+  s.log_state_stream = kv.num("log_state_stream", 1) != 0;
+  s.log_min_free_mb = kv.num("log_min_free_mb", s.log_min_free_mb);
+  s.announce_wait_s = kv.num("announce_wait_s", s.announce_wait_s);
+  s.announce_max_s = kv.num("announce_max_s", s.announce_max_s);
+  s.announce_s_per_char = kv.num("announce_s_per_char", s.announce_s_per_char);
   s.max_run_s = kv.num("max_run_s", s.max_run_s);
   s.max_authority = kv.num("max_authority", s.max_authority);
   s.watchdog_s = kv.num("watchdog_s", s.watchdog_s);
@@ -107,6 +130,7 @@ Site Site::load(const std::string& path) {
   g.diverge_rad = kv.num("diverge_rad", g.diverge_rad);
   g.diverge_ticks = (int)kv.num("diverge_ticks", g.diverge_ticks);
   g.loop_overrun_factor = kv.num("loop_overrun_factor", g.loop_overrun_factor);
+  g.torque_ff = kv.num("guard_torque_ff", 0) != 0;
   ExitConfig& x = s.exit;
   x.fallen_tilt_rad = kv.num("fallen_tilt_rad", x.fallen_tilt_rad);
   x.unstable_tilt_rad = kv.num("unstable_tilt_rad", x.unstable_tilt_rad);
@@ -114,6 +138,12 @@ Site Site::load(const std::string& path) {
   x.unstable_gyro_rad_s = kv.num("unstable_gyro_rad_s", x.unstable_gyro_rad_s);
   x.unstable_tilt_rate_rad_s = kv.num("unstable_tilt_rate_rad_s", x.unstable_tilt_rate_rad_s);
   x.unstable_debounce_samples = (int)kv.num("unstable_debounce_samples", x.unstable_debounce_samples);
+  x.ref_aware = kv.num("ref_aware_unstable", x.ref_aware ? 1 : 0) != 0;
+  x.unstable_hard_tilt_rad = kv.num("unstable_hard_tilt_rad", x.unstable_hard_tilt_rad);
+  x.ref_dev_rad = kv.num("ref_dev_rad", x.ref_dev_rad);
+  x.ref_dev_min_tilt_rad = kv.num("ref_dev_min_tilt_rad", x.ref_dev_min_tilt_rad);
+  x.ref_dev_growth_rad_s = kv.num("ref_dev_growth_rad_s", x.ref_dev_growth_rad_s);
+  x.ref_max_age_s = kv.num("ref_max_age_s", x.ref_max_age_s);
   x.attitude_max_age_s = kv.num("attitude_max_age_s", x.attitude_max_age_s);
   x.l2b_hold_s = kv.num("l2b_hold_s", x.l2b_hold_s);
   x.confirm_timeout_s = kv.num("exit_confirm_timeout_s", x.confirm_timeout_s);
@@ -128,9 +158,9 @@ Site Site::load(const std::string& path) {
   static const char* known[] = {"entry_fsm_allowed", "oem_lowcmd_confirmed", "oem_lowcmd_expected_writers", "iface", "run_s", "authority", "ref_mode", "tts", "tts_volume", "max_run_s", "max_authority", "ramp_s", "end_hold_s", "allow_partial_authority",
       "watchdog_s", "max_entry_tilt_rad", "quiescent_dq", "min_state_hz", "state_stale_s", "state_frozen_ticks", "limit_fault_tol_rad", "speed_fault_frac", "unknown_speed_limit",
       "torque_meas_fault_frac", "torque_meas_fault_ticks", "max_tilt_rad", "max_gyro_rad_s", "pos_margin_rad", "target_speed_frac", "torque_cmd_frac", "diverge_rad", "diverge_ticks",
-      "loop_overrun_factor", "fallen_tilt_rad", "unstable_tilt_rad", "unstable_soft_tilt_rad", "unstable_gyro_rad_s", "unstable_tilt_rate_rad_s", "unstable_debounce_samples", "attitude_max_age_s",
+      "loop_overrun_factor", "fallen_tilt_rad", "unstable_tilt_rad", "unstable_soft_tilt_rad", "unstable_gyro_rad_s", "unstable_tilt_rate_rad_s", "unstable_debounce_samples", "ref_aware_unstable", "unstable_hard_tilt_rad", "ref_dev_rad", "ref_dev_min_tilt_rad", "ref_dev_growth_rad_s", "ref_max_age_s", "attitude_max_age_s",
       "l2b_hold_s", "exit_confirm_timeout_s", "exit_fsm_poll_s", "exit_dwell_s", "exit_stable_window_s", "exit_min_stable_polls", "exit_mismatch_fail_s", "exit_unconfirmed_hold_s",
-      "exit_hold_gain_scale", "exit_owner_timeout_s"};
+      "exit_hold_gain_scale", "exit_owner_timeout_s", "log_preroll_s", "log_post_exit_s", "log_obs", "log_state_stream", "log_min_free_mb", "guard_torque_ff", "lead_in_s", "settle_stable_s", "settle_timeout_s", "announce_wait_s", "announce_max_s", "announce_s_per_char"};
   for (auto& kvp : kv.m) {
     bool k = false;
     for (const char* n : known) k = k || kvp.first == n;
@@ -149,6 +179,15 @@ Site Site::load(const std::string& path) {
   if (!(s.max_entry_tilt_rad >= 0.1 && s.max_entry_tilt_rad <= 0.8)) bad("site.conf: max_entry_tilt_rad must be in [0.1, 0.8]");
   if (!(s.quiescent_dq >= 0.1 && s.quiescent_dq <= 2.0)) bad("site.conf: quiescent_dq must be in [0.1, 2.0]");
   if (!(s.min_state_hz >= 15 && s.min_state_hz <= 500)) bad("site.conf: min_state_hz must be in [15, 500]");
+  if (!(s.lead_in_s >= 0 && s.lead_in_s <= 3)) bad("site.conf: lead_in_s must be in [0, 3] s");
+  if (!(s.settle_stable_s >= 0.3 && s.settle_stable_s <= 10)) bad("site.conf: settle_stable_s must be in [0.3, 10] s");
+  if (!(s.settle_timeout_s >= 3 && s.settle_timeout_s <= 120)) bad("site.conf: settle_timeout_s must be in [3, 120] s");
+  if (!(s.log_preroll_s >= 0 && s.log_preroll_s <= 10)) bad("site.conf: log_preroll_s must be in [0, 10] s");
+  if (!(s.log_post_exit_s >= 0 && s.log_post_exit_s <= 15)) bad("site.conf: log_post_exit_s must be in [0, 15] s");
+  if (!(s.log_min_free_mb >= 0 && s.log_min_free_mb <= 100000)) bad("site.conf: log_min_free_mb must be in [0, 100000]");
+  if (!(s.announce_wait_s >= 0 && s.announce_wait_s <= 5)) bad("site.conf: announce_wait_s must be in [0, 5] s");
+  if (!(s.announce_max_s >= 1 && s.announce_max_s <= 10)) bad("site.conf: announce_max_s must be in [1, 10] s");
+  if (!(s.announce_s_per_char >= 0.1 && s.announce_s_per_char <= 1.0)) bad("site.conf: announce_s_per_char must be in [0.1, 1.0] s");
   return s;
 }
 
@@ -170,7 +209,71 @@ void GuardianAlive::write(const std::string& path, const GuardianAlive& g) {
   write_atomic(path, b);  // atomic: readers never see a half-written file
 }
 
+bool load_modes(const std::string& path, std::vector<ModeSpec>& out, std::string& err) {
+  KV kv;
+  out.clear();
+  if (!kv.load(path)) { err = "cannot read " + path; return false; }
+  std::vector<std::string> order;
+  {  // KV is a map: keep the file order for the menu
+    std::string doc;
+    read_file(path, doc);
+    size_t p = 0;
+    while (p < doc.size()) {
+      size_t e = doc.find('\n', p);
+      std::string line = doc.substr(p, e == std::string::npos ? std::string::npos : e - p);
+      p = e == std::string::npos ? doc.size() : e + 1;
+      if (line.rfind("mode_", 0) == 0) { std::string k = line.substr(0, line.find_first_of(" \t")); order.push_back(k); }
+    }
+  }
+  for (auto& k : order) {
+    auto& v = kv.m[k];
+    if (v.size() < 5) { err = k + ": need <ref_mode> <run_s> <evidence 0|1> <voice> <description>"; return false; }
+    ModeSpec m;
+    m.name = k.substr(5);
+    m.ref_mode = v[0];
+    try { m.run_s = std::stod(v[1]); } catch (...) { err = k + ": bad run_s"; return false; }
+    m.validated = v[2] == "1";
+    m.voice = v[3];
+    for (size_t i = 4; i < v.size(); i++) m.desc += (i > 4 ? " " : "") + v[i];
+    m.check_only = m.ref_mode == "check";
+    if (m.check_only) m.ref_mode = "paused";
+    if (m.ref_mode != "paused" && m.ref_mode != "running") { err = k + ": ref_mode must be paused|running|check"; return false; }
+    if (!(m.run_s > 0 && m.run_s <= ABS_MAX_RUN_S)) { err = k + ": run_s out of (0, " + std::to_string((int)ABS_MAX_RUN_S) + "]"; return false; }
+    out.push_back(m);
+  }
+  if (out.empty()) { err = "no mode_* lines in " + path; return false; }
+  return true;
+}
+
+ArtifactHashes hash_artifacts(const Paths& p) {
+  ArtifactHashes h;
+  std::string x;
+  auto hf = [&](const std::string& path) { return sha256_file(path, x) ? x : std::string("MISSING"); };
+  char b[4096];
+  ssize_t n = readlink("/proc/self/exe", b, sizeof b - 1);
+  h.exe = n > 0 ? hf(std::string(b, (size_t)n)) : "UNKNOWN";
+  h.policy = hf(p.asset("policy.onnx")); h.params = hf(p.asset("policy_params.txt")); h.motion = hf(p.asset("motion.bin")); h.fk_chain = hf(p.asset("fk_chain.txt"));
+  h.site_conf = hf(p.config + "/site.conf"); h.modes_conf = hf(p.config + "/modes.conf");
+  h.policy_ok = h.policy == FROZEN_SHA256_POLICY; h.params_ok = h.params == FROZEN_SHA256_POLICY_PARAMS; h.motion_ok = h.motion == FROZEN_SHA256_MOTION;
+  return h;
+}
+std::string manifest_json(const Paths& p, const ArtifactHashes& h, const std::string& extra) {
+  struct utsname u;
+  uname(&u);
+  char host[128] = {0};
+  gethostname(host, sizeof host - 1);
+  std::string s = "{" + jstr("schema", PM_LOG_SCHEMA) + "," + jstr("program_version", PM_VERSION) + "," + jstr("build_stamp", PM_BUILD_STAMP) + "," + jstr("policy_name", PM_POLICY_NAME) + "," +
+                  jstr("root", p.root) + "," + jstr("host", host) + "," + jstr("machine", u.machine) + "," + jstr("kernel", u.release) + "," + jnum("wall_at_write", wall()) + "," + jnum("mono_at_write", mono()) + "," +
+                  "\"sha256\":{" + jstr("executable", h.exe) + "," + jstr("policy_onnx", h.policy) + "," + jstr("policy_params", h.params) + "," + jstr("motion_bin", h.motion) + "," + jstr("fk_chain", h.fk_chain) + "," +
+                  jstr("site_conf", h.site_conf) + "," + jstr("modes_conf", h.modes_conf) + "}," +
+                  "\"frozen_expected\":{" + jstr("policy_onnx", FROZEN_SHA256_POLICY) + "," + jstr("policy_params", FROZEN_SHA256_POLICY_PARAMS) + "," + jstr("motion_bin", FROZEN_SHA256_MOTION) + "," + jstr("p2_baseline_policy_onnx", P2_BASELINE_SHA256_POLICY) + "}," +
+                  jbool("policy_frozen_ok", h.policy_ok) + "," + jbool("params_frozen_ok", h.params_ok) + "," + jbool("motion_frozen_ok", h.motion_ok);
+  if (!extra.empty()) s += "," + extra;
+  return s + "}";
+}
+
 void fast_exit(int rc) {
+  RunLogger::flush_all(0.5);  // P5.1: queued log records reach the disk even on the fast exit path
   fflush(stdout);
   fflush(stderr);
   _exit(rc);
@@ -184,6 +287,11 @@ std::string json_find_raw(const std::string& doc, const std::string& key) {
   if (k == std::string::npos) return "";
   k += key.size() + 3;
   while (k < doc.size() && doc[k] == ' ') k++;
+  if (k < doc.size() && doc[k] == '"') {  // P5.2: a string value may contain ',' or '}' (refusal reasons do): end at the closing unescaped quote
+    size_t i = k + 1;
+    while (i < doc.size() && doc[i] != '"') i += doc[i] == '\\' ? 2 : 1;
+    return doc.substr(k, std::min(doc.size(), i + 1) - k);
+  }
   size_t e = doc.find_first_of(",}\n", k);
   return doc.substr(k, e == std::string::npos ? std::string::npos : e - k);
 }
@@ -209,6 +317,7 @@ int main(int argc, char** argv) {
   else if (cmd == "guardian") rc = run_guardian(argc - 2, argv + 2, p);
   else if (cmd == "release") rc = run_release(argc - 2, argv + 2, p);
   else if (cmd == "selfcheck") rc = run_selfcheck(argc - 2, argv + 2, p);
+  else if (cmd == "logtool") rc = run_logtool(argc - 2, argv + 2, p);
   else { fprintf(stderr, "unknown command %s\n", cmd.c_str()); return 2; }
   fflush(stdout);
   fflush(stderr);

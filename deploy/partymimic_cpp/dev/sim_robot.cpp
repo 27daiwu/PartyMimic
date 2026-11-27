@@ -12,6 +12,8 @@
 //      --user-reject          SwitchToUserCtrl is rejected (3203): ARM fails while control may be half-taken
 //      --ignore-internal      every SwitchToInternalCtrl: rpc 0, fsm unchanged
 //      --walkrun-drop-s S     WALKRUN reaches the entry fsm, then drops into fsm 1 S seconds later
+//      --quat-replay F[,OFF]  (V1.6 A1) while in user control the published IMU quaternion + gyro are REPLAYED from file F (lines "t qw qx qy qz gx gy gz", 200 Hz MuJoCo rollout of the dance,
+//                             body-frame gyro), t = seconds since user control began minus OFF (exit_paths.sh S44 uses -0.02: the policy loop starts ~0.2 s after SwitchToUserCtrl is confirmed). Lets the runner be driven through the whole dance / a recorded fall.
 //      /<dir>/mute            existing file = rt/lowstate muted (communication loss) while it exists
 //      /<dir>/tilt            "roll_rad gyro_x" hook file: forces the published attitude (removed file = off)
 //  * validates user_lowcmd frames (CRC, mode=1, mode_machine=5) and logs events to <dir>/sim_events.log
@@ -29,6 +31,7 @@
 #include <cstring>
 #include <fstream>
 #include <mutex>
+#include <vector>
 
 #include "gamepad.hpp"
 #include "pm/link.hpp"
@@ -63,6 +66,9 @@ static bool g_user_reject = false, g_ignore_internal = false, g_ignore_walkrun =
 static std::atomic<double> g_tilt{0};        // current published roll
 static std::atomic<double> g_drop_at{0};
 static std::atomic<long> g_exit_req_n{0};
+struct ReplayRow { double t, q[4], g[3]; };
+static std::vector<ReplayRow> g_replay;
+static double g_replay_off = 0.2;
 
 static int parse_data(const std::string& p) {
   size_t k = p.find("\"data\"");
@@ -146,6 +152,12 @@ int main(int argc, char** argv) {
     else if (a == "--internal-delay") g_internal_delay = atof(nx().c_str());
     else if (a == "--oem-fall-tilt") g_oem_fall_tilt = atof(nx().c_str());
     else if (a == "--tilt-ramp") sscanf(nx().c_str(), "%lf,%lf,%lf", &ramp_d, &ramp_r, &ramp_t);
+    else if (a == "--quat-replay") {
+      std::string v = nx(); size_t c = v.find(',');
+      if (c != std::string::npos) { g_replay_off = atof(v.c_str() + c + 1); v = v.substr(0, c); }
+      std::ifstream rf(v); ReplayRow r; while (rf >> r.t >> r.q[0] >> r.q[1] >> r.q[2] >> r.q[3] >> r.g[0] >> r.g[1] >> r.g[2]) g_replay.push_back(r);
+      fprintf(stderr, "quat-replay: %zu rows from %s, offset %.3f s\n", g_replay.size(), v.c_str(), g_replay_off);
+    }
     else if (a == "--flip-after-user-s") flip_after_user_s = atof(nx().c_str());
     else if (a == "--hz") hz = atof(nx().c_str());
     else if (a == "--rival") rival = nx();   // user_lowcmd | arm_sdk: a competing controller ACTIVELY writing
@@ -239,11 +251,29 @@ int main(int argc, char** argv) {
     if (g_drop_at.load() > 0 && now > g_drop_at.load()) { g_drop_at = 0; g_fsm = 1; ev("OEM drops into fsm 1 after the walkrun-drop delay"); }
     g_tilt = roll;
     if (roll != 0) quat = {(float)std::cos(roll / 2), (float)std::sin(roll / 2), 0, 0};
+    double rgx = 0, rgy = 0, rgz = 0;
+    if (!g_replay.empty() && fsm == 1000 && user_t0 > 0) {   // V1.6 A1: recorded dance / fall attitude
+      const double tr = now - user_t0 - g_replay_off;
+      if (tr >= 0) {
+        size_t lo = 0, hi = g_replay.size() - 1;
+        if (tr >= g_replay[hi].t) lo = hi; else { while (hi - lo > 1) { size_t mid = (lo + hi) / 2; if (g_replay[mid].t <= tr) lo = mid; else hi = mid; } }
+        const ReplayRow& a0 = g_replay[lo]; const ReplayRow& a1 = g_replay[std::min(lo + 1, g_replay.size() - 1)];
+        const double w = a1.t > a0.t ? std::min(1.0, std::max(0.0, (tr - a0.t) / (a1.t - a0.t))) : 0.0;
+        double q[4], n = 0, sgn = (a0.q[0] * a1.q[0] + a0.q[1] * a1.q[1] + a0.q[2] * a1.q[2] + a0.q[3] * a1.q[3]) < 0 ? -1.0 : 1.0;
+        for (int i = 0; i < 4; i++) { q[i] = (1 - w) * a0.q[i] + w * sgn * a1.q[i]; n += q[i] * q[i]; }
+        n = std::sqrt(n);
+        for (int i = 0; i < 4; i++) quat[i] = (float)(q[i] / n);
+        rgx = (1 - w) * a0.g[0] + w * a1.g[0]; rgy = (1 - w) * a0.g[1] + w * a1.g[1]; rgz = (1 - w) * a0.g[2] + w * a1.g[2];
+        const double qx = q[1] / n, qy = q[2] / n;
+        g_tilt = std::acos(std::max(-1.0, std::min(1.0, 1.0 - 2.0 * (qx * qx + qy * qy))));
+        static bool rl = false; if (!rl) { rl = true; ev("quat replay started (t_replay " + std::to_string(tr) + " s)"); }
+      }
+    }
     msg.tick() = ++tick;
     msg.mode_machine() = 5;
     for (int i = 0; i < 29; i++) { msg.motor_state()[i].q() = (float)q[i]; msg.motor_state()[i].dq() = (float)dq[i]; msg.motor_state()[i].tau_est() = 0.f; }
     for (int i = 0; i < 4; i++) msg.imu_state().quaternion()[i] = quat[i];
-    for (int i = 0; i < 3; i++) msg.imu_state().gyroscope()[i] = i == 0 ? (float)gyro_x : 0.f;
+    for (int i = 0; i < 3; i++) msg.imu_state().gyroscope()[i] = i == 0 ? (float)(gyro_x + rgx) : i == 1 ? (float)rgy : (float)rgz;
     unitree::common::REMOTE_DATA_RX rx;
     memset(rx.buff, 0, 40);
     rx.RF_RX.btn.value = keys;

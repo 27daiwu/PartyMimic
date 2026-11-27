@@ -2,6 +2,7 @@
 #include "pm/guard.hpp"
 
 #include <cmath>
+#include <cstring>
 
 namespace pm {
 
@@ -110,37 +111,84 @@ Fault SafetyGuard::check_state(const Vec& q, const Vec& dq, const Vec& tau, cons
   return Fault::NONE;
 }
 
-CmdOut SafetyGuard::filter_command(const Vec& q_t_in, const Vec& kp_in, const Vec& kd_in, const Vec& q, const Vec& dq, double dt, double t) {
+const char* clip_reason_text(uint8_t m) {
+  static thread_local char b[96];
+  b[0] = 0;
+  auto add = [&](const char* n) { if (b[0]) strcat(b, "|"); strcat(b, n); };
+  if (m & CLIP_POS) add("POS_LIMIT");
+  if (m & CLIP_SLEW) add("SLEW");
+  if (m & CLIP_TORQUE) add("TORQUE");
+  if (m & CLIP_POS2) add("POS_LIMIT_AFTER_TORQUE");
+  if (m & CLIP_KP) add("KP_CAP");
+  return b;
+}
+
+CmdOut SafetyGuard::filter_command(const Vec& q_t_in, const Vec& kp_in, const Vec& kd_in, const Vec& q, const Vec& dq, double dt, double t, FilterTrace* tr, bool allow_ff) {
   CmdOut o;
-  o.q = q_t_in; o.kp = kp_in; o.kd = kd_in; o.dq.setZero(); o.tau.setZero();  // dq_target forced 0, tau_ff forced 0
+  o.q = q_t_in; o.kp = kp_in; o.kd = kd_in; o.dq.setZero(); o.tau.setZero(); o.tau_train.setZero();  // dq_target forced 0, tau_ff 0 unless torque_ff
   if (!(q_t_in.allFinite() && kp_in.allFinite() && kd_in.allFinite())) { trip(Fault::CMD_INVALID, "non-finite command", t); throw GuardReject("non-finite command"); }
   stats.cmds++;
   if ((kp_in.array() < 0).any() || (kd_in.array() < 0).any()) { trip(Fault::CMD_INVALID, "negative gain", t); throw GuardReject("negative gain"); }
+  Vec kp_before = o.kp;
   o.kp = o.kp.cwiseMin(kp_cap_);
   // 1) clip the target inside the joint limits with margin
   Vec lo = p_.pos_lo.array() + c_.pos_margin_rad, hi = p_.pos_hi.array() - c_.pos_margin_rad;
   Vec cl = o.q.cwiseMax(lo).cwiseMin(hi);
   if (cl != o.q) stats.pos_clipped++;
+  Vec after_pos = cl;
   o.q = cl;
   // 2) target slew limit (seeded with the measured q when taking control)
   if (!have_prev_) { prev_target_ = q; have_prev_ = true; }
+  Vec prev_before = prev_target_;
   Vec step = speed_lim_ * c_.target_speed_frac * dt;
   Vec sl = o.q.cwiseMax(prev_target_ - step).cwiseMin(prev_target_ + step);
   if (sl != o.q) stats.slew_clipped++;
+  Vec after_slew = sl;
   o.q = sl;
   // 3) PD torque limit by shrinking the position error: tau = kp*e - kd*dq must stay within frac*effort
   bool tclip = false;
+  Vec tau_pre = Vec::Zero(), tau_lim = Vec::Zero();
+  std::array<bool, N> tclip_j{};
   for (int i = 0; i < N; i++) {
     if (o.kp[i] <= 0) continue;
     double Lt = c_.torque_cmd_frac * p_.effort_lim[i], a = o.kd[i] * dq[i];
     double e_lo = (-Lt + a) / o.kp[i], e_hi = (Lt + a) / o.kp[i], e = o.q[i] - q[i];
+    tau_pre[i] = o.kp[i] * e - a;
+    tau_lim[i] = Lt;
     double ec = std::max(e_lo, std::min(e_hi, e));
-    if (ec != e) tclip = true;
+    if (ec != e) { tclip = true; tclip_j[i] = true; }
     o.q[i] = q[i] + ec;
   }
   if (tclip) stats.torque_clipped++;
+  Vec after_torque = o.q;
   o.q = o.q.cwiseMax(lo).cwiseMin(hi);
   prev_target_ = o.q;
+  // training-equivalent torque of the UNCLIPPED target (logged always); sent as feed-forward only with torque_ff
+  for (int i = 0; i < N; i++) {
+    const double Lt = c_.torque_cmd_frac * p_.effort_lim[i];
+    const double want = std::max(-Lt, std::min(Lt, kp_in[i] * (q_t_in[i] - q[i]) - kd_in[i] * dq[i]));
+    o.tau_train[i] = want;
+    if (c_.torque_ff && allow_ff && o.kp[i] > 0) {
+      const double have = o.kp[i] * (o.q[i] - q[i]) - o.kd[i] * dq[i];
+      o.tau[i] = std::max(-Lt, std::min(Lt, want - have));
+    }
+  }
+  if (tr) {
+    tr->raw = q_t_in; tr->after_pos = after_pos; tr->after_slew = after_slew; tr->after_torque = after_torque; tr->final_q = o.q;
+    tr->lo = lo; tr->hi = hi; tr->prev_target = prev_before; tr->slew_step = step; tr->tau_pre_nm = tau_pre; tr->tau_lim_nm = tau_lim;
+    tr->n_clipped = 0; tr->any_mask = 0;
+    for (int i = 0; i < N; i++) {
+      uint8_t m = 0;
+      if (after_pos[i] != q_t_in[i]) m |= CLIP_POS;
+      if (after_slew[i] != after_pos[i]) m |= CLIP_SLEW;
+      if (tclip_j[i]) m |= CLIP_TORQUE;  // (q + (target - q) differs from target by rounding: only a real torque clip counts)
+      if (o.q[i] != after_torque[i]) m |= CLIP_POS2;
+      if (o.kp[i] != kp_before[i]) m |= CLIP_KP;
+      tr->mask[i] = m;
+      if (m) tr->n_clipped++;
+      tr->any_mask |= m;
+    }
+  }
   return o;
 }
 

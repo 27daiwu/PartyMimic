@@ -1,0 +1,24 @@
+# 部署配置 cpp_g1_v1（版本化；只描述“怎么上机”，与训练配置完全解耦：同一个 checkpoint 可以用不同部署配置重新打包，无需重训）
+# 基础框架：deploy/partymimic_cpp（最新 C++ 部署：遥控器 F1+F3 / L1+A / 双击 START / L2+B、可恢复退出自动回 IDLE、guardian、日志系统）
+# 本流水线只替换“资产”（policy.onnx / policy_params.txt / motion.bin / fk_chain.txt + 冻结哈希 + 自检基准帧）和下面的可调项，不改任何 C++ 源码逻辑。
+name: cpp_g1_v1
+description: "P5.3 C++ 部署框架 + 流水线资产；舞蹈类模式默认前导冻结 1 s（复现训练 padded 片段）"
+framework: deploy/partymimic_cpp
+package_prefix: partymimic_cpp
+# site.conf 覆盖项（空 = 框架默认值，selfcheck 7d 检查的就是默认值；改动后请重新通过 selfcheck）
+site_overrides: {}
+# 测试模式（modes.conf）；dance 的秒数 = 动作时长（自动取 motion.bin），不手填
+modes:
+  hold_s: 3.0
+  exit_s: 8.0
+  clip2_s: 2.0
+  clip4_s: 4.0
+# 未验证模式的“真机准入”规则（不可被命令行绕过，只能通过 --allow-unadmitted 产出带 UNADMITTED 标记的开发包）
+admission:
+  require_sim2sim_pass: true
+  require_onnx_parity: true
+  require_eval_gate: true
+  require_cpp_selfcheck: true     # 开发机 x86 编译 + partymimic selfcheck 全 PASS
+onnx_parity_max_abs: 1.0e-3        # ONNX vs PyTorch 策略输出
+# 开发机 x86 构建自检使用 pip 的 onnxruntime 动态库 + 框架自带头文件（仅用于验证，不进入包）
+dev_build_check: true

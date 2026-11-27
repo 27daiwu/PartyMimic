@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Stop the service (a running motion is stopped: immediate hand-back to WalkRun, confirmed by GetFsmId). ./stop.sh --estop also latches the software e-stop = emergency PASSIVE channel (/tmp/partymimic_cpp_ESTOP; clear with ./ack.sh).
+# Stop the service (a running motion is stopped: immediate hand-back to WalkRun, confirmed by GetFsmId). ./stop.sh --estop also latches the software e-stop = emergency PASSIVE channel (/tmp/partymimic_cpp_ESTOP; remove with ./ack.sh).
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; cd "$HERE"
 [ "${1:-}" = "--estop" ] && { echo "estop $(date +%s)" > /tmp/partymimic_cpp_ESTOP; echo "e-stop latched"; }
 LOGS="${PM_LOGS:-logs}"

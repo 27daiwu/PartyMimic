@@ -1,0 +1,41 @@
+# 部署配置 cpp_g1_v3_1（V1.6.1 部署热修复；由 cpp_g1_v3 复制而来，v1/v2/v3 文件保持不变，v3 已被取代）
+# 只改部署端（框架 deploy/partymimic_cpp + 打包器 pmpipe/package.py），**不训练、模型与数据不变**。与 v3 的区别：
+#   * 取消人工授权门及其全部依赖：删除 authorize.sh / config/authz.conf / src/authz.cpp、二次确认（--yes / --accept-unvalidated / --confirm-protection / --i-confirm-protection）、授权有效期；
+#     没有任何新增的人工确认/审批/授权。./start.sh 直接启动完整舞蹈服务（除 mode check 外全部武装）
+#   * F1+F3 加载并检查策略，成功后**持续保持 READY（无超时）**，等待 L1+A；双击 START 仍可取消
+#   * L1+A 播报“开始执行”，播报完成后延迟 announce_wait_s = 0.5 s 再接管（同 v3）
+#   * 正常或异常结束后服务自行回到 IDLE（SETTLE -> IDLE，不再有 HOLD / ack），可重复执行；下一次 F1+F3 的实时准入负责拦截不安全状态
+#   * 保留：运行时失稳保护（参考感知 + 硬上限）、Guardian、双击 START 交还 WalkRun、L2+B 急停、e-stop 文件
+name: cpp_g1_v3_1
+description: "V1.6.1：取消人工授权门，./start.sh 直接起完整舞蹈服务；READY 无超时；结束后自动回 IDLE 可重复；其余保护不变"
+framework: deploy/partymimic_cpp
+package_prefix: partymimic_cpp
+site_overrides: {}
+modes:
+  hold_s: 3.0
+  exit_s: 8.0
+  clip2_s: 2.0
+  clip4_s: 4.0
+admission:
+  require_sim2sim_pass: true
+  require_onnx_parity: true
+  require_eval_gate: true
+  require_cpp_selfcheck: true
+onnx_parity_max_abs: 1.0e-3
+dev_build_check: true
+zip:
+  script_mode: 0o755        # 所有带 #! 的文件 / *.sh / *.so
+  data_mode: 0o644
+  verify_extractors: [unzip, bsdtar, python]
+timeline:
+  lead_in_s: 1.0            # = 框架 site.conf lead_in_s（打包器按框架文件核对）
+  end_hold_s: 0.5
+  min_failsafe_margin_s: 0.5
+# V1.6.1 打包规则（不能被命令行关闭，违反即中止打包）：
+#   包内不得有 authorize.sh / config/authz.conf / src/authz.cpp；start.sh/build.sh/ack.sh/stop.sh 不得含授权/确认措辞或任何交互 read；ack.sh 不得提问；
+#   框架 runner/service 不得再有 READY 超时；site.conf announce_wait_s 必须 = 0.5 且在 [0,5] 内
+v16:
+  announce_wait_s: 0.5
+  no_authorisation: true
+  ready_no_timeout: true
+  start_sh_no_prompt: true

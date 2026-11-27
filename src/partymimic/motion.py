@@ -45,6 +45,7 @@ def sparse5_bodies(tracked: tuple[str, ...]) -> list[int]:
 class MotionLib:
     def __init__(self, files: list[str], kin: Kinematics, device: str, load_motion: Callable[[str], MotionArrays]):
         self.device = device
+        self.files = list(files)
         self.names = [os.path.splitext(os.path.basename(f))[0] for f in files]
         ps, qs, js = [], [], []
         lens = []
@@ -156,6 +157,58 @@ class MotionLib:
             s = self.clip_id == c
             floor[s] = z[s].quantile(q, dim=0)
         self.ref_contact = ((z < floor + margin) & (vh < vmax)).float()
+
+    ref_conf = None  # V1.7: contact_refine labels (set_contact_labels); None = legacy labels only
+    ref_contact_refine = None
+
+    def set_contact_labels(self, per_clip: list[dict], feet: list[int], sole_loc, sole_r: float, hi_conf: float = 0.7, stable_k: int = 3,
+                           zmp_lo: float = 0.02, zmp_hi: float = 0.10) -> None:
+        """V1.7: attach contact_refine sidecar labels (one dict per clip in clip order: state (T,2) 0 swing / 1 stance / 2 uncertain, stance_prob, conf, zmp_margin_m, ground_mm), already
+        frame-aligned with the (padded) clip. Sets, all (num_frames, 2) float unless noted:
+          ref_contact_refine  hard 1 / 0 on certain stance / swing, the stance probability on uncertain frames (soft label)
+          ref_conf            confidence of the decided state
+          ref_hi_stance / ref_hi_swing   stance / swing with conf >= hi_conf
+          ref_stable          high-confidence stance for frames t-k .. t+k within the clip (no transition nearby)
+          ref_sole_h          lowest foot-sole point height of the reference [m] (tilt invariant)
+          ref_up              reference foot clearly lifted (sole > 27 mm)
+          ref_infeas (N,)     0..1 dynamic-infeasibility from the kinematic-ZMP margin (negative margin = ZMP outside the support polygon), 0.2 s box smoothed"""
+        dev = self.device
+        cat = lambda k, dt=torch.float32: torch.cat([torch.as_tensor(d[k]).to(dt) for d in per_clip]).to(dev)  # noqa: E731
+        assert sum(len(d["state"]) for d in per_clip) == self.num_frames, "label frames != motion frames"
+        state, prob, conf = cat("state", torch.int64), cat("stance_prob"), cat("conf")
+        # label weight for --contact_conf_weight: confidence, x0.3 on uncertain frames, 0 within +-3 frames of a stance<->non-stance toggle of the foot (C1: those frames carry most label errors)
+        st_b = (state == 1).float()
+        near = torch.zeros_like(st_b)
+        for c in range(len(self.names)):
+            s0, e0 = int(self.clip_start[c]), int(self.clip_end[c]) + 1
+            x = st_b[s0:e0].t().unsqueeze(0)
+            tog = (x[..., 1:] != x[..., :-1]).float()
+            tog = torch.nn.functional.pad(tog, (1, 0))
+            near[s0:e0] = torch.nn.functional.max_pool1d(tog, 7, 1, 3).squeeze(0).t()
+        self.ref_conf = conf * torch.where(state == 2, 0.3, 1.0) * (1 - near)
+        self.ref_contact_refine = torch.where(state == 1, torch.ones_like(prob), torch.where(state == 0, torch.zeros_like(prob), prob))
+        hs, hw = ((state == 1) & (conf >= hi_conf)).float(), ((state == 0) & (conf >= hi_conf)).float()
+        self.ref_hi_stance, self.ref_hi_swing = hs, hw
+        stable = torch.zeros_like(hs)
+        for c in range(len(self.names)):
+            s0, e0 = int(self.clip_start[c]), int(self.clip_end[c]) + 1
+            x = hs[s0:e0].t().unsqueeze(0)  # (1,2,T)
+            stable[s0:e0] = (-torch.nn.functional.max_pool1d(-x, 2 * stable_k + 1, 1, stable_k, ceil_mode=False)).squeeze(0).t()  # erosion with the clip edges treated as stance (+inf pad)
+        self.ref_stable = stable
+        # reference foot-sole height: ankle position + R sole_loc - r (lowest of the 14 points)
+        loc = torch.as_tensor(sole_loc, dtype=torch.float32, device=dev)  # (2,14,3)
+        fp, fR = self.body_p[:, feet], self.body_R[:, feet]  # (N,2,3), (N,2,3,3)
+        z = fp[..., 2].unsqueeze(-1) + torch.einsum("nfk,fpk->nfp", fR[..., 2, :], loc)
+        self.ref_sole_h = z.min(-1).values - sole_r - cat("ground_mm").unsqueeze(-1) / 1000  # over the calibrated ground curve (0 for the contact-fixed data)
+        self.ref_up = (self.ref_sole_h > 0.027).float()
+        zm = torch.nan_to_num(cat("zmp_margin_m"), nan=1.0)  # undefined (no support / flight) = not infeasible
+        inf = ((-zm - zmp_lo) / (zmp_hi - zmp_lo)).clamp(0, 1)
+        out = torch.zeros_like(inf)
+        for c in range(len(self.names)):
+            s0, e0 = int(self.clip_start[c]), int(self.clip_end[c]) + 1
+            x = inf[s0:e0].view(1, 1, -1)
+            out[s0:e0] = torch.nn.functional.avg_pool1d(torch.nn.functional.pad(x, (5, 5), mode="replicate"), 11, 1).view(-1)
+        self.ref_infeas = out
 
     interface = "joint"
     obs_err = "none"  # --obs_err: error block of the joint interface (mdp.obs_err_dim)

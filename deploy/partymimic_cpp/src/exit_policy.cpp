@@ -17,6 +17,11 @@ bool validate(const ExitConfig& c, std::string& err) {
   if (!(c.unstable_gyro_rad_s >= 0.3 && c.unstable_gyro_rad_s <= 10)) return bad("unstable_gyro_rad_s", c.unstable_gyro_rad_s, "[0.3, 10]");
   if (!(c.unstable_tilt_rate_rad_s == 0 || (c.unstable_tilt_rate_rad_s >= 0.5 && c.unstable_tilt_rate_rad_s <= 20))) return bad("unstable_tilt_rate_rad_s", c.unstable_tilt_rate_rad_s, "0 or [0.5, 20]");
   if (!(c.unstable_debounce_samples >= 1 && c.unstable_debounce_samples <= 10)) return bad("unstable_debounce_samples", c.unstable_debounce_samples, "[1, 10]");
+  if (!(c.unstable_hard_tilt_rad >= 0.55 && c.unstable_hard_tilt_rad < c.fallen_tilt_rad && c.unstable_hard_tilt_rad > c.unstable_tilt_rad)) return bad("unstable_hard_tilt_rad", c.unstable_hard_tilt_rad, "[0.55, fallen_tilt_rad) and > unstable_tilt_rad");
+  if (!(c.ref_dev_rad >= 0.15 && c.ref_dev_rad <= 1.0)) return bad("ref_dev_rad", c.ref_dev_rad, "[0.15, 1.0]");
+  if (!(c.ref_dev_min_tilt_rad >= 0.10 && c.ref_dev_min_tilt_rad <= c.unstable_hard_tilt_rad)) return bad("ref_dev_min_tilt_rad", c.ref_dev_min_tilt_rad, "[0.10, unstable_hard_tilt_rad]");
+  if (!(c.ref_dev_growth_rad_s >= -2.0 && c.ref_dev_growth_rad_s <= 10.0)) return bad("ref_dev_growth_rad_s", c.ref_dev_growth_rad_s, "[-2, 10] (-2 = off)");
+  if (!(c.ref_max_age_s >= 0.04 && c.ref_max_age_s <= 1.0)) return bad("ref_max_age_s", c.ref_max_age_s, "[0.04, 1.0]");
   if (!(c.attitude_max_age_s >= 0.02 && c.attitude_max_age_s <= 0.5)) return bad("attitude_max_age_s", c.attitude_max_age_s, "[0.02, 0.5]");
   if (!(c.l2b_hold_s >= 0.02 && c.l2b_hold_s <= 1.0)) return bad("l2b_hold_s", c.l2b_hold_s, "[0.02, 1.0]");
   if (!(c.confirm_timeout_s >= 0.5 && c.confirm_timeout_s <= 10)) return bad("exit_confirm_timeout_s", c.confirm_timeout_s, "[0.5, 10]");
@@ -54,6 +59,38 @@ Attitude attitude_of(const StatePtr& st, double now_mono, double max_age_s) {
 }
 
 // ------------------------------------------------------------------ stability monitor
+void gravity_of_quat(const std::array<double, 4>& q, double g[3]) {
+  g[0] = g[1] = g[2] = NAN;
+  for (double v : q) if (!std::isfinite(v)) return;
+  const double n = std::sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
+  if (!(n > 0.9 && n < 1.1)) return;
+  const double w = q[0] / n, x = q[1] / n, y = q[2] / n, z = q[3] / n;
+  g[0] = -2.0 * (x * z - w * y);  // R^T * (0, 0, -1)
+  g[1] = -2.0 * (y * z + w * x);
+  g[2] = -(1.0 - 2.0 * (x * x + y * y));
+}
+
+void RefChannel::set(bool valid, const std::array<float, 4>& q, double t_mono, uint64_t tick) {
+  RefAttitude r;
+  r.t_set = t_mono; r.tick = tick;
+  double g[3];
+  gravity_of_quat({q[0], q[1], q[2], q[3]}, g);
+  const bool fin = std::isfinite(g[0]) && std::isfinite(g[1]) && std::isfinite(g[2]);
+  r.valid = valid && fin;
+  if (fin) { r.g[0] = g[0]; r.g[1] = g[1]; r.g[2] = g[2]; r.tilt = std::acos(std::max(-1.0, std::min(1.0, -g[2]))); }
+  std::lock_guard<std::mutex> lk(m_);
+  r_ = r;
+}
+
+const char* tilt_rule_name(TiltRule r) {
+  switch (r) {
+    case TiltRule::FALLEN: return "FALLEN"; case TiltRule::HARD: return "HARD_CAP"; case TiltRule::REF_DEV: return "REF_DEV"; case TiltRule::ABS_RATE: return "ABS_RATE"; case TiltRule::LIMIT: return "FIXED_LIMIT";
+    default: return "NONE";
+  }
+}
+
+static double js(double v) { return std::isfinite(v) ? v : -999.0; }
+
 Stability StabilityMonitor::update(const LinkState& st) {
   if (st.seq == last_seq_) return level_;
   last_seq_ = st.seq;
@@ -61,26 +98,94 @@ Stability StabilityMonitor::update(const LinkState& st) {
   if (!std::isfinite(t) || !std::isfinite(st.gyro[0]) || !std::isfinite(st.gyro[1])) return level_;  // invalid data is the guard's business (STATE_INVALID)
   tilt = t;
   gyro_xy = std::hypot(st.gyro[0], st.gyro[1]);
+  max_tilt = std::max(max_tilt, tilt); max_gyro_xy = std::max(max_gyro_xy, gyro_xy);
   hist_.push_back({st.arrival, t});
   while (hist_.size() > 2 && st.arrival - hist_[1].first >= 0.040) hist_.pop_front();  // keep one sample >= 40 ms old, drop older ones
   tilt_rate = 0;
   if (hist_.size() >= 2 && st.arrival - hist_.front().first >= 0.015) tilt_rate = (t - hist_.front().second) / (st.arrival - hist_.front().first);
-  bool fallen = t > c_.fallen_tilt_rad;
-  bool unstable = t > c_.unstable_tilt_rad || (t > c_.unstable_soft_tilt_rad && (gyro_xy > c_.unstable_gyro_rad_s || (c_.unstable_tilt_rate_rad_s > 0 && tilt_rate > c_.unstable_tilt_rate_rad_s)));
+  // ---- reference-relative quantities (only while a valid, fresh reference is published)
+  RefAttitude ra;
+  bool use_ref = false;
+  double age = NAN;
+  if (ref_ && c_.ref_aware) {
+    ra = ref_->get();
+    age = st.arrival - ra.t_set;
+    use_ref = ra.valid && age <= c_.ref_max_age_s;
+  }
+  double d = NAN;
+  dev_rate = 0;
+  bool dev_rate_ok = false;   // the growth criterion needs >= 15 ms of error history (the first 15 ms after a reference (re)appears cannot trip REF_DEV)
+  if (use_ref) {
+    double g[3];
+    gravity_of_quat(st.quat, g);
+    d = std::acos(std::max(-1.0, std::min(1.0, g[0] * ra.g[0] + g[1] * ra.g[1] + g[2] * ra.g[2])));
+    dhist_.push_back({st.arrival, d});
+    while (dhist_.size() > 2 && st.arrival - dhist_[1].first >= 0.040) dhist_.pop_front();
+    dev_rate_ok = false;
+    if (dhist_.size() >= 2 && st.arrival - dhist_.front().first >= 0.015) { dev_rate = (d - dhist_.front().second) / (st.arrival - dhist_.front().first); dev_rate_ok = true; }
+    n_ref_used++;
+    max_dev = std::max(max_dev, d); max_ref_tilt = std::max(max_ref_tilt, ra.tilt); max_excess = std::max(max_excess, t - ra.tilt);
+    if (t > c_.ref_dev_min_tilt_rad) min_margin_dev = std::min(min_margin_dev, c_.ref_dev_rad - d);
+  } else {
+    dhist_.clear();  // a reference that comes back must not inherit a stale error history
+    min_margin_limit = std::min(min_margin_limit, c_.unstable_tilt_rad - t);
+  }
+  n_samples++;
+  dev = d; ref_tilt = use_ref ? ra.tilt : NAN; ref_used = use_ref;
+  min_margin_hard = std::min(min_margin_hard, c_.unstable_hard_tilt_rad - t);
+  // ---- the rules
+  const bool fallen = t > c_.fallen_tilt_rad;
+  const bool hard = t > c_.unstable_hard_tilt_rad;                                                     // absolute, never reference dependent
+  const bool ref_dev = use_ref && t > c_.ref_dev_min_tilt_rad && d > c_.ref_dev_rad && (dev_rate_ok || c_.ref_dev_growth_rad_s <= -2.0) && dev_rate >= c_.ref_dev_growth_rad_s;
+  const bool abs_rate = t > c_.unstable_soft_tilt_rad && (gyro_xy > c_.unstable_gyro_rad_s || (c_.unstable_tilt_rate_rad_s > 0 && tilt_rate > c_.unstable_tilt_rate_rad_s));
+  const bool limit = !use_ref && t > c_.unstable_tilt_rad;                                              // no usable reference: the old conservative fixed limit
+  const bool unstable = hard || ref_dev || abs_rate || limit;
   n_fallen_ = fallen ? n_fallen_ + 1 : 0;
   n_unstable_ = unstable ? n_unstable_ + 1 : 0;
-  char b[200];
+  char b[420];
   if (n_fallen_ >= c_.unstable_debounce_samples) {
     snprintf(b, sizeof b, "fallen: tilt %.2f rad > %.2f", t, c_.fallen_tilt_rad);
     detail_ = b;
     level_ = Stability::FALLEN;
+    trig_ = TiltTrigger{TiltRule::FALLEN, use_ref, t, ra.tilt, d, dev_rate, gyro_xy, tilt_rate, age, st.arrival};
   } else if (n_unstable_ >= c_.unstable_debounce_samples) {
-    snprintf(b, sizeof b, "unstable: tilt %.2f rad, |gyro_xy| %.2f rad/s, tilt rate %.2f rad/s (limits tilt>%.2f | tilt>%.2f & gyro>%.2f / rate>%.2f)", t, gyro_xy, tilt_rate, c_.unstable_tilt_rad,
-             c_.unstable_soft_tilt_rad, c_.unstable_gyro_rad_s, c_.unstable_tilt_rate_rad_s);
+    const TiltRule rule = hard ? TiltRule::HARD : ref_dev ? TiltRule::REF_DEV : abs_rate ? TiltRule::ABS_RATE : TiltRule::LIMIT;
+    trig_ = TiltTrigger{rule, use_ref, t, use_ref ? ra.tilt : NAN, d, dev_rate, gyro_xy, tilt_rate, age, st.arrival};
+    snprintf(b, sizeof b, "unstable[%s]: tilt %.2f rad, ref tilt %.2f, gravity err %.2f rad (d/dt %.2f), |gyro_xy| %.2f rad/s, tilt rate %.2f rad/s (limits: hard cap tilt>%.2f | ref: err>%.2f & tilt>%.2f & growth>=%.2f | tilt>%.2f & gyro>%.2f / rate>%.2f | no valid ref: tilt>%.2f; ref %s)",
+             tilt_rule_name(rule), t, use_ref ? ra.tilt : -1.0, use_ref ? d : -1.0, dev_rate, gyro_xy, tilt_rate, c_.unstable_hard_tilt_rad, c_.ref_dev_rad, c_.ref_dev_min_tilt_rad, c_.ref_dev_growth_rad_s,
+             c_.unstable_soft_tilt_rad, c_.unstable_gyro_rad_s, c_.unstable_tilt_rate_rad_s, c_.unstable_tilt_rad, use_ref ? "valid" : "NOT valid -> fixed limit");
     detail_ = b;
     level_ = Stability::UNSTABLE;
   } else level_ = Stability::OK;
   return level_;
+}
+
+std::string StabilityMonitor::trigger_json() const {
+  char b[900];
+  snprintf(b, sizeof b,
+           "\"monitor\":\"%s\",\"level\":\"%s\",\"rule\":\"%s\",\"ref_valid\":%s,\"tilt_rad\":%.4f,\"ref_tilt_rad\":%.4f,\"gravity_err_rad\":%.4f,\"gravity_err_rate_rad_s\":%.3f,\"tilt_minus_ref_rad\":%.4f,"
+           "\"gyro_xy_rad_s\":%.3f,\"tilt_rate_rad_s\":%.3f,\"ref_age_ms\":%.1f,\"limits\":{\"hard_tilt_rad\":%.3f,\"ref_dev_rad\":%.3f,\"ref_dev_min_tilt_rad\":%.3f,\"ref_dev_growth_rad_s\":%.3f,\"soft_tilt_rad\":%.3f,\"gyro_rad_s\":%.3f,"
+           "\"tilt_rate_rad_s\":%.3f,\"fixed_limit_tilt_rad\":%.3f,\"fallen_tilt_rad\":%.3f,\"debounce_samples\":%d}",
+           name_.c_str(), level_ == Stability::FALLEN ? "FALLEN" : level_ == Stability::UNSTABLE ? "UNSTABLE" : "OK", tilt_rule_name(trig_.rule), trig_.ref_used ? "true" : "false", trig_.tilt, js(trig_.ref_tilt), js(trig_.dev), js(trig_.dev_rate),
+           std::isfinite(trig_.ref_tilt) ? trig_.tilt - trig_.ref_tilt : -999.0, trig_.gyro_xy, trig_.tilt_rate, js(trig_.ref_age_s) * 1e3, c_.unstable_hard_tilt_rad, c_.ref_dev_rad, c_.ref_dev_min_tilt_rad, c_.ref_dev_growth_rad_s,
+           c_.unstable_soft_tilt_rad, c_.unstable_gyro_rad_s, c_.unstable_tilt_rate_rad_s, c_.unstable_tilt_rad, c_.fallen_tilt_rad, c_.unstable_debounce_samples);
+  return b;
+}
+
+std::string tilt_judge_json(const ExitConfig& c, const StabilityMonitor& a, const StabilityMonitor& m) {
+  const long n = std::max(a.n_samples, m.n_samples), nr = std::max(a.n_ref_used, m.n_ref_used);   // the two monitors see (nearly) the same stream: report the busier one
+  const double mdev = std::max(a.max_dev, m.max_dev), mrt = std::max(a.max_ref_tilt, m.max_ref_tilt), mex = std::max(a.max_excess, m.max_excess);
+  const double mm_dev = std::min(a.min_margin_dev, m.min_margin_dev), mm_hard = std::min(a.min_margin_hard, m.min_margin_hard), mm_lim = std::min(a.min_margin_limit, m.min_margin_limit);
+  char b[1400];
+  snprintf(b, sizeof b,
+           "{\"ref_aware\":%s,\"config\":{\"unstable_hard_tilt_rad\":%.4f,\"ref_dev_rad\":%.4f,\"ref_dev_min_tilt_rad\":%.4f,\"ref_dev_growth_rad_s\":%.4f,\"ref_max_age_s\":%.4f,\"unstable_tilt_rad\":%.4f,\"unstable_soft_tilt_rad\":%.4f,"
+           "\"unstable_gyro_rad_s\":%.4f,\"unstable_tilt_rate_rad_s\":%.4f,\"unstable_debounce_samples\":%d,\"fallen_tilt_rad\":%.4f},"
+           "\"stats\":{\"samples\":%ld,\"samples_ref_valid\":%ld,\"max_tilt_rad\":%.4f,\"max_ref_tilt_rad\":%.4f,\"max_gravity_err_rad\":%.4f,\"max_tilt_minus_ref_rad\":%.4f,"
+           "\"min_margin_gravity_err_rad\":%.4f,\"min_margin_hard_cap_rad\":%.4f,\"min_margin_fixed_limit_rad\":%.4f}}",
+           c.ref_aware ? "true" : "false", c.unstable_hard_tilt_rad, c.ref_dev_rad, c.ref_dev_min_tilt_rad, c.ref_dev_growth_rad_s, c.ref_max_age_s, c.unstable_tilt_rad, c.unstable_soft_tilt_rad, c.unstable_gyro_rad_s,
+           c.unstable_tilt_rate_rad_s, c.unstable_debounce_samples, c.fallen_tilt_rad, n, nr, std::max(a.max_tilt, m.max_tilt), nr ? mrt : -1.0, nr ? mdev : -1.0, nr ? mex : -999.0,
+           mm_dev < 1e8 ? mm_dev : 999.0, mm_hard < 1e8 ? mm_hard : 999.0, mm_lim < 1e8 ? mm_lim : 999.0);
+  return b;
 }
 
 // ------------------------------------------------------------------ decision table (single source of truth)
@@ -170,6 +275,9 @@ std::string exit_outcome_json(const ExitRequest& r, const ExitOutcome& o) {
   s += "],\"timing_ms_from_detect\":{";
   s += num("t_event", o.t_event > 0 ? ms_rel(o.t_event, t0) : "-1") + "," + num("t_detect", "0") + "," + num("t_rpc_sent", ms_rel(o.t_rpc_sent, t0)) + "," + num("t_rpc_returned", ms_rel(o.t_rpc_returned, t0)) + "," +
        num("t_fsm_confirmed", ms_rel(o.t_fsm_confirmed, t0)) + "," + num("t_stable_confirmed", ms_rel(o.t_stable_confirmed, t0)) + "," + num("t_done", ms_rel(o.t_done, t0)) + "},";
+  auto att = [&](const Attitude& a) { return std::string("{") + jbool("valid", a.valid) + "," + jnum("tilt_rad", a.tilt) + "," + jnum("gyro_xy_rad_s", a.gyro_xy) + "," + jnum("roll", a.roll) + "," + jnum("pitch", a.pitch) + "," + jnum("age_ms", a.age_s * 1e3) + "}"; };
+  s += "\"attitude_at_decision\":" + att(r.att) + ",\"attitude_at_rpc_sent\":" + att(o.att_rpc_sent) + ",\"attitude_at_fsm_confirmed\":" + att(o.att_confirmed) + "," +
+       num("t_frames_stopped", ms_rel(o.t_frames_stopped, t0)) + ",";
   s += jnum("detect_to_rpc_sent_ms", o.t_rpc_sent > 0 ? (o.t_rpc_sent - o.t_detect) * 1e3 : -1) + "," + jnum("rpc_latency_ms", o.t_rpc_returned > 0 ? (o.t_rpc_returned - o.t_rpc_sent) * 1e3 : -1) + "," +
        jnum("event_to_rpc_sent_ms", (o.t_event > 0 && o.t_rpc_sent > 0) ? (o.t_rpc_sent - o.t_event) * 1e3 : -1) + ",\"fsm_trace\":[";
   for (size_t i = 0; i < o.fsm_trace.size() && i < 60; i++) {
@@ -212,6 +320,9 @@ bool ExitExecutor::submit(const ExitRequest& req) {
   if (!state_.compare_exchange_strong(exp, 1)) return false;
   req_ = req;
   mode_ = req.decision.mode;
+  lg("exit_submit", "\"mode\":\"" + req.decision.mode + "\",\"class\":\"" + req.decision.cls + "\",\"owner\":\"" + req.owner + "\",\"trigger\":\"" + req.trigger_fault + "\",\"detail\":\"" + json_escape(req.detail) +
+              "\",\"why\":\"" + json_escape(req.decision.why) + "\",\"tilt\":" + std::to_string(req.att.tilt) + ",\"gyro_xy\":" + std::to_string(req.att.gyro_xy) + ",\"att_valid\":" + (req.att.valid ? "true" : "false") +
+              ",\"t_detect\":" + std::to_string(req.t_detect) + ",\"t_event\":" + std::to_string(req.t_event));
   auto st = link_.latest();
   snap_q_ = (st && st->q.allFinite()) ? st->q : Vec(Vec::Zero());  // the measured q at the trigger time = what the HOLD frames pin
   const FrameKind kind = mode_ == "PASSIVE" ? FrameKind::DAMP : FrameKind::HOLD;
@@ -231,6 +342,7 @@ void ExitExecutor::escalate_passive(const std::string& why) {
   if (state_.load() == 2) return;
   if (!escalate_.exchange(true)) {
     out_.escalation_why = why;
+    lg("exit_escalate_passive", "\"why\":\"" + json_escape(why) + "\"");
     frame_kind_ = (int)FrameKind::DAMP;  // damp frames at once; the RPC follows when the current one returns
     logf("[exit] ESCALATE to emergency PASSIVE: %s", why.c_str());
   }
@@ -257,13 +369,15 @@ void ExitExecutor::frame_loop() {
 
 int ExitExecutor::call_rpc(const std::string& mode) {
   double ts = mono();
-  if (out_.t_rpc_sent == 0) out_.t_rpc_sent = ts;
+  if (out_.t_rpc_sent == 0) { out_.t_rpc_sent = ts; out_.att_rpc_sent = attitude_of(link_.latest(), ts, 1e9); }
+  lg("exit_rpc_attempt", "\"mode\":\"" + mode + "\",\"attempt\":" + std::to_string(out_.rpc_codes.size() + 1) + ",\"t_since_detect_ms\":" + std::to_string((ts - out_.t_detect) * 1e3));
   int rc = link_.switch_to_internal(mode);
   out_.t_rpc_returned = mono();
   out_.rpc_codes.push_back(rc);
   out_.rpc_modes.push_back(mode);
   out_.rpc_code = rc;
   logf("[exit] SwitchToInternalCtrl(%s) rc=%d (%.1f ms)", mode.c_str(), rc, (out_.t_rpc_returned - ts) * 1e3);
+  lg("exit_rpc_result", "\"mode\":\"" + mode + "\",\"rc\":" + std::to_string(rc) + ",\"latency_ms\":" + std::to_string((out_.t_rpc_returned - ts) * 1e3));
   return rc;
 }
 
@@ -294,12 +408,18 @@ int ExitExecutor::confirm(const std::string& mode, double timeout_s, bool& /*unu
       last_fsm = cf.second;
       const bool match = exit_fsm_matches(mode, cf.second);
       const bool user = req_.user_fsm >= 0 && cf.second == req_.user_fsm;
-      if (mode == "WALKRUN" && frame_kind_.load() == (int)FrameKind::HOLD && req_.user_fsm >= 0 && !user) frames_on_ = false;  // the fsm left the user fsm: the OEM has control again, stop writing (official example does the same)
+      if (mode == "WALKRUN" && frame_kind_.load() == (int)FrameKind::HOLD && req_.user_fsm >= 0 && !user) { if (frames_on_.exchange(false)) { out_.t_frames_stopped = now; lg("exit_frames_stopped", "\"fsm\":" + std::to_string(cf.second)); } }  // the fsm left the user fsm: the OEM has control again, stop writing (official example does the same)
       if (match) {
-        if (t_match == 0) { t_match = now; if (out_.t_fsm_confirmed == 0) out_.t_fsm_confirmed = now; if (mode == "WALKRUN") frames_on_ = false; }
+        if (t_match == 0) {
+          t_match = now;
+          if (out_.t_fsm_confirmed == 0) { out_.t_fsm_confirmed = now; out_.att_confirmed = attitude_of(link_.latest(), now, 1e9); }
+          if (mode == "WALKRUN") { if (frames_on_.exchange(false)) out_.t_frames_stopped = now; }
+          lg("exit_fsm_matched", "\"mode\":\"" + mode + "\",\"fsm\":" + std::to_string(cf.second) + ",\"t_since_detect_ms\":" + std::to_string((now - out_.t_detect) * 1e3) + ",\"tilt\":" + std::to_string(out_.att_confirmed.tilt) + ",\"gyro_xy\":" + std::to_string(out_.att_confirmed.gyro_xy));
+        }
         ok_polls++;
-        if (now - t_match >= c_.dwell_s + c_.stable_window_s && ok_polls >= c_.min_stable_polls) { out_.t_stable_confirmed = now; return 0; }
+        if (now - t_match >= c_.dwell_s + c_.stable_window_s && ok_polls >= c_.min_stable_polls) { out_.t_stable_confirmed = now; lg("exit_stable_confirmed", "\"mode\":\"" + mode + "\",\"fsm\":" + std::to_string(cf.second) + ",\"polls\":" + std::to_string(ok_polls)); return 0; }
       } else if (t_match > 0) {
+        lg("exit_fsm_dropped_after_match", "\"mode\":\"" + mode + "\",\"fsm\":" + std::to_string(cf.second));
         return 1;  // matched before, then fell out of the expected set (e.g. OEM dropped into fsm 1): recovery failed
       } else if (user) {
         mismatch_since = 0;
@@ -448,6 +568,8 @@ void ExitExecutor::worker() {
   o.t_done = mono();
   o.verdict = classify_exit(req_, o);
   if (o.final_mode == "UNKNOWN" && !o.settled) o.verdict.final_mode = "UNKNOWN";
+  lg("exit_result", "\"result\":\"" + o.verdict.result + "\",\"requested_mode\":\"" + o.requested_mode + "\",\"final_mode\":\"" + o.final_mode + "\",\"final_fsm\":" + std::to_string(o.final_fsm) +
+                       ",\"confirmed\":" + (o.confirmed ? "true" : "false") + ",\"settled\":" + (o.settled ? "true" : "false") + ",\"note\":\"" + json_escape(o.note) + "\"");
   o.done = true;
   logf("[exit] RESULT %s requested=%s final_mode=%s final_fsm=%d recovery_ok=%d detect->rpc_sent %.2f ms", o.verdict.result.c_str(), o.requested_mode.c_str(), o.final_mode.c_str(), o.final_fsm,
        (int)o.verdict.recovery_ok, o.t_rpc_sent > 0 ? (o.t_rpc_sent - o.t_detect) * 1e3 : -1.0);

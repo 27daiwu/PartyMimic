@@ -1,0 +1,86 @@
+# 训练配置 robust_d_v1（版本化；只描述“怎么训练”，与部署配置完全解耦）
+# 来源：results/p4/scripts/train_p4.sh（SSB 已验证 robust_d）+ YTHN 追加项（results/ythn/scripts/train_ythn.sh，同一套参数）：
+#   机器人变体 g1mj_ythn = P4 robust_d 域随机化 + 力矩上限/质量随机 + 部署护栏语义；--w_target_limit / --contact_reward。
+# 修改任何参数请复制为新文件（如 robust_d_v2.yaml），不要原地改；每个 run 会冻结一份副本与 sha256。
+name: robust_d_v1
+description: "P4 robust_d + YTHN 目标越限惩罚/接触项；官方预训练 g1_mlp 起步，微调"
+robot: g1mj_ythn
+iterations: 40000          # 默认总轮次；./pm train/run --iters N 覆盖
+seed: 0
+num_envs: 4096             # 默认并行环境数；显存不足时 ./pm 自动降档并记录
+ckpt_every: 1000           # ckpt_XXXXXX.pt 间隔（供评估/筛选）
+last_every: 1000           # last.pt（完整可续训状态）间隔
+init:
+  checkpoint: checkpoints/g1_mlp.pt     # 官方预训练
+  surgery: tools/p4_ckpt_surgery.py     # 把世界模型/critic 输入加宽到该 robot 的 xi（新增列零初始化，输出不变）
+# 以下参数逐项传给 python -m partymimic.train（与 train_ythn.sh 逐字一致，顺序无关）
+train_args:
+  - --motion_prior=
+  - --log_every=25
+  - --buffer_steps=512
+  - --utd=0.4
+  - --warmup_steps=64
+  - --horizon=32
+  - --goal_frames=10
+  - --hist=10
+  - --interface=joint
+  - --obs_err=kp
+  - --ref_enc=mlp
+  - --enc_hidden=2048,1024,512,256
+  - --dec_hidden=2048,1024,512,256
+  - --wm_hidden=1024,1024,1024
+  - --wm_structured
+  - --pi_ref_skip
+  - --no-kp_skip
+  - --kp_aux=0
+  - --amp=bf16
+  - --std_scale=0.35
+  - --wrist_kernel=0.5
+  - --wrist_std_mult=0.5
+  - --wrist_payload=2
+  - --payload_p0=0.25
+  - --action_noise=0
+  - --contact_reward=0.5
+  - --w_target_limit=-1.0
+  - --fail_reset=0.3
+  - --div_k=0
+  - --reset_alloc=none
+  - --start_alloc=none
+  - --wm_window=8
+  - --wm_batches=5
+  - --wm_batch=512
+  - --pi_batch=512
+  - --wm_only_iters=0
+  - --wm_mirror=0.5
+  - --wm_opt=muon
+  - --pi_opt=muon
+  - --pi_muon_io
+  - --muon_wd=0.1
+  - --pi_beta1=0.9
+  - --pi_clip_value=0.1
+  - --pi_ema=0.995
+  - --sil=1
+  - --sil_wmax=5
+  - --critic_epochs=5
+  - --critic_minibatches=4
+  - --v_gcons=0.5
+  - --v_gcons_n=2048
+  - --v_gcons_epochs=1
+  - --gamma=0.99
+  - --lam=0.95
+  - --v_clip=10
+  - --v_clip_raw
+  - --wm_guard=5
+  - --v_guard=5
+  - --lr=0.0004
+  - --pi_lr_mult=4
+  - --lr_decay_iters=250000
+  - --lr_decay_ret=0.75
+  - --lr_decay_len=300
+  - --lr_decay_by=1400
+# 监督器（自动续训 / 异常回滚）
+supervisor:
+  max_restarts: 30
+  stall_s: 900
+  keep_backups: 3
+  min_free_disk_gib: 15

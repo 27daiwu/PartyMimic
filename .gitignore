@@ -32,3 +32,6 @@ deploy/partymimic/tool*
 
 
 deploy/make_zip.sh
+
+pipeline/test*
+pipeline/ref_data

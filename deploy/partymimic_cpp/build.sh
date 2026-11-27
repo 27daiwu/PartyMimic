@@ -24,6 +24,7 @@ if [ "$ARCH" != aarch64 ] && [ -z "$ORT_ROOT" ]; then die "this package bundles 
 step 2 "frozen artifacts"
 ( cd assets && sha256sum -c --quiet SHA256SUMS ) || die "assets do not match SHA256SUMS (corrupted unzip?)"
 echo "assets/policy.onnx, policy_params.txt, motion.bin, fk_chain.txt: sha256 OK"
+( cd config && [ -f modes.conf ] ) || die "config/modes.conf missing"
 
 step 3 "dependencies already on the robot"
 [ -d /usr/include/eigen3/Eigen ] || [ -d /usr/local/include/eigen3/Eigen ] || [ -d third_party/eigen3/Eigen ] || die "Eigen3 headers not found (sudo apt install -y libeigen3-dev; wbc_nx/remote_start uses /usr/include/eigen3 too)"
@@ -62,5 +63,5 @@ echo "all shared libraries resolved"
 
 step 6 "self-check (offline: policy numerics, timing, FK, CRC, control logic; DDS/robot are NOT used)"
 if [ $CHECK -eq 1 ]; then build/partymimic selfcheck || die "SELFCHECK FAILED: do not run on the robot; send build.make.log and this output"; else echo "skipped (--skip-check)"; fi
-mkdir -p logs; chmod +x start.sh stop.sh ack.sh build.sh 2>/dev/null || true
-echo; echo "BUILD OK (nothing was sent to any robot).  Next: ./start.sh"
+mkdir -p logs; chmod +x start.sh stop.sh ack.sh status.sh export_logs.sh build.sh 2>/dev/null || true
+echo; echo "BUILD OK (nothing was sent to any robot).  Next: ./start.sh   (nothing else: no authorisation, no confirmation; then F1+F3 -> READY -> L1+A.  Other modes: ./start.sh --list; logs: ./export_logs.sh)"

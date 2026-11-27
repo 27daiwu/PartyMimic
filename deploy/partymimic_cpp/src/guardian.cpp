@@ -23,6 +23,7 @@
 #include "pm/exit_policy.hpp"
 #include "pm/handback.hpp"
 #include "pm/link.hpp"
+#include "pm/logtool.hpp"
 #include "pm/profile.hpp"
 #include "pm/remote.hpp"
 #include "pm/session.hpp"
@@ -34,7 +35,7 @@ std::atomic<bool> g_stop{false};
 void on_signal(int) { g_stop.store(true); }
 
 struct TakeOverReport {
-  std::string reason, note;
+  std::string reason, note, log_dir;
   int killed_pid = 0;
   double kill_ms = 0;
   bool have = false;
@@ -49,7 +50,7 @@ struct Ctx {
   std::unique_ptr<SafetyGuard> guard;
   std::mutex mx;            // guards `ga`, `guard`
   GuardianAlive ga;
-  std::string alive_file;
+  std::string alive_file, logs;   // logs = <root>/logs ("" = no take-over log)
   void set_phase(const std::string& ph, const std::string& owner) {
     std::lock_guard<std::mutex> lk(mx);
     ga.exit_phase = ph; ga.exit_owner = owner; ga.exit_t = wall();
@@ -79,6 +80,7 @@ TakeOverReport take_over(Ctx& cx, const std::string& reason, Fault fault_kind, i
   req.precheck = precheck;  // only when the runner is already gone (it may have handed back itself): one GetFsmId, no blind RPC
   req.t_detect = t_detect;
   req.t_event = st0 ? st0->arrival : 0;
+  req.att = x.att;
   if (pid > 0 && pid != (int)getpid()) {
     double tk = mono();
     if (kill(pid, SIGKILL) == 0) {
@@ -100,19 +102,47 @@ TakeOverReport take_over(Ctx& cx, const std::string& reason, Fault fault_kind, i
     if (st0) cx.guard->reset_target(st0->q);
   }
   const double scale = cx.site.exit.hold_gain_scale;
-  auto frames = [&cx, scale](FrameKind k, const Vec& q_snap) {
+  // P5.1: the take-over is recorded like a run: logs/guardian/takeover_<time>/ (events incl. every RPC, exit steps, every HOLD/DAMP frame, lowstate stream from now to +2 s after the exit)
+  auto glog = std::make_shared<RunLogger>();
+  if (!cx.logs.empty()) {
+    LogOptions lo2;
+    rep.log_dir = cx.logs + "/guardian/takeover_" + timestamp_compact();
+    lo2.dir = rep.log_dir; lo2.joint_names = cx.params->names; lo2.obs_bin = false; lo2.preroll_s = 0; lo2.install_crash_handlers = false; lo2.tag = "guardian";
+    if (glog->open(lo2)) {
+      link.add_state_listener([glog](const LinkState& s) { glog->state(s); });  // (the shared_ptr keeps the logger alive as long as the Link may call back)
+      link.set_rpc_observer([glog](const RpcEvent& e) {
+        char b[400];
+        snprintf(b, sizeof b, "\"api\":\"%s\",\"arg\":\"%s\",\"rc\":%d,\"fsm\":%d,\"t_req\":%.6f,\"t_resp\":%.6f,\"latency_ms\":%.3f", e.api.c_str(), e.arg.c_str(), e.rc, e.fsm, e.t_req, e.t_resp, (e.t_resp - e.t_req) * 1e3);
+        glog->event_at(e.t_resp, "rpc", b);
+      });
+      glog->begin_stream();
+      glog->event("take_over", jstr("reason", reason) + "," + jstr("fault_kind", fault_name(fault_kind)) + "," + jnum("runner_pid", pid) + "," + jnum("killed_pid", rep.killed_pid) + "," + jnum("kill_ms", rep.kill_ms) + "," +
+                                   jstr("mode", req.decision.mode) + "," + jstr("class", req.decision.cls) + "," + jstr("why", req.decision.why) + "," + jnum("entry_fsm", entry_fsm) + "," + jnum("user_fsm", user_fsm) + "," + jnum("t_detect", t_detect));
+    }
+  }
+  auto frames = [&cx, scale, glog](FrameKind k, const Vec& q_snap) {
     Link& l = *cx.link;
     auto st = l.latest();
     Vec qm = (st && st->q.allFinite()) ? st->q : q_snap;
+    auto log_frame = [&](uint8_t kind, const Vec& q, const Vec& kp, const Vec& kd) {
+      if (!glog->is_open()) return;
+      FrameRec f;
+      f.t_mono = mono(); f.kind = kind; f.send_us = (float)l.last_send_us();
+      if (st) { f.state_seq = st->seq; for (int i = 0; i < N; i++) f.q_meas[i] = (float)st->q[i]; }
+      for (int i = 0; i < N; i++) { f.q_cmd[i] = (float)q[i]; f.kp[i] = (float)kp[i]; f.kd[i] = (float)kd[i]; }
+      glog->frame(f);
+    };
     if (k == FrameKind::HOLD && st) {
       try {
         std::lock_guard<std::mutex> lk(cx.mx);
-        CmdOut c = cx.guard->filter_command(q_snap, cx.params->kp * scale, cx.params->kd * scale, st->q, st->dq, 0.01, 0);
+        CmdOut c = cx.guard->filter_command(q_snap, cx.params->kp * scale, cx.params->kd * scale, st->q, st->dq, 0.01, 0, nullptr, false);
         l.send(c.q, c.dq, c.tau, c.kp, c.kd);
+        log_frame(FK_HOLD, c.q, c.kp, c.kd);
         return;
       } catch (const GuardReject&) {}
     }
     l.send(qm, Vec::Zero(), Vec::Zero(), Vec::Zero(), Vec::Constant(DAMP_KD));
+    log_frame(FK_DAMP, qm, Vec::Zero(), Vec::Constant(DAMP_KD));
   };
   cx.set_phase("EXITING", "guardian");
   const std::string estop = cx.site.exit.estop_file;
@@ -122,9 +152,24 @@ TakeOverReport take_over(Ctx& cx, const std::string& reason, Fault fault_kind, i
                       y.att = attitude_of(link.latest(), mono(), cx.site.exit.attitude_max_age_s);
                       return decide_exit(y, cx.site.exit).mode == "PASSIVE" ? "PASSIVE" : "";
                     },
-                    [estop]() { return file_exists(estop); });
+                    [estop]() { return file_exists(estop); },
+                    [glog](const std::string& k, const std::string& f) { glog->event(k, f); });
   rep.have = true;
   if (!rep.hb.out.settled) logf("[guardian] !!! EXIT UNCONFIRMED: keep damping; use the remote controller damping / emergency stop. Do NOT approach.");
+  if (glog->is_open()) {  // post-exit window, then the same report / anomaly files as a runner
+    sleep_s(std::min(2.0, std::max(0.0, cx.site.log_post_exit_s)));
+    glog->end_stream();
+    LogStats ls = glog->stats();
+    glog->event("log_stats", log_stats_fields(ls, glog->lowstate()));
+    glog->close();
+    // (the report text is built by the caller; the base file is written here from the pieces we have)
+    const ExitOutcome& o = rep.hb.out;
+    std::string base = "{\"summary\":{" + jstr("result", o.verdict.result) + "," + jstr("exit_reason", reason) + "," + jstr("fault", fault_name(fault_kind)) + "," + jstr("final_mode", o.final_mode) + "," + jnum("final_fsm", o.final_fsm) + "," +
+                       jbool("recovery_ok", o.verdict.recovery_ok) + "," + jbool("took_control", true) + "},\"result\":\"" + o.verdict.result + "\"," + jstr("exit_reason", reason) + "," + jstr("owner", "guardian") + "," + jbool("recovery_ok", o.verdict.recovery_ok) +
+                       "," + jbool("took_control", true) + "," + jnum("run_s", 0) + "," + jnum("authority", 0) + ",\"exit_detail\":" + exit_outcome_json(rep.hb.req, o) + "}";
+    FinalizeResult fr = finalize_run(rep.log_dir, base, "guardian take-over log");
+    logf("[guardian] take-over log: %s (anomaly %s: %d fail, %d warn)", rep.log_dir.c_str(), fr.level.c_str(), fr.n_fail, fr.n_warn);
+  }
   return rep;
 }
 
@@ -135,7 +180,7 @@ int report_rc(const TakeOverReport& r) {
 }
 
 std::string report_json(const TakeOverReport& r, const std::string& action) {
-  std::string s = "{" + jstr("action", action) + "," + jstr("reason", r.reason) + "," + jnum("killed_pid", r.killed_pid) + "," + jnum("kill_ms", r.kill_ms);
+  std::string s = "{" + jstr("action", action) + "," + jstr("reason", r.reason) + "," + jnum("killed_pid", r.killed_pid) + "," + jnum("kill_ms", r.kill_ms) + "," + jstr("log_dir", r.log_dir);
   if (r.have) {
     const ExitOutcome& o = r.hb.out;
     s += "," + jstr("result", o.verdict.result) + "," + jstr("requested_mode", o.requested_mode) + "," + jstr("final_mode", o.final_mode) + "," + jnum("final_fsm", o.final_fsm) + "," + jbool("recovery_ok", o.verdict.recovery_ok) + "," +
@@ -176,6 +221,7 @@ int run_guardian(int argc, char** argv, const Paths& P) {
   cx.params = &params;
   cx.guard.reset(new SafetyGuard(params, cx.site.guard));
   cx.alive_file = alive_file;
+  cx.logs = P.logs;
 
   LinkOpts lo;
   lo.rpc_timeout_s = 1.0;
@@ -319,6 +365,7 @@ int run_release(int argc, char** argv, const Paths& P) {
   Params params;
   if (!Params::load(P.asset("policy_params.txt"), params, err)) { fprintf(stderr, "release: %s\n", err.c_str()); return 2; }
   cx.params = &params;
+  cx.logs = P.logs;
   cx.guard.reset(new SafetyGuard(params, cx.site.guard));
   LinkOpts lo;
   lo.rpc_timeout_s = 1.0;

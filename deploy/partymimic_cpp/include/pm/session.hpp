@@ -20,6 +20,7 @@
 #include "pm/link.hpp"
 #include "pm/profile.hpp"
 #include "pm/remote.hpp"
+#include "pm/runlog.hpp"
 
 namespace pm {
 
@@ -83,7 +84,9 @@ class ControlSession {
   double now() const { return mono() - t0_; }
   StatePtr state() const { return link_.latest(); }
   Fault check_state_once(const StatePtr& st);
-  bool preflight(std::vector<PreflightItem>& out, double listen_s = -1, double rate_window_s = 1.0);
+  // retro (V1.5.1): evaluate the stream-rate and foreign-writer windows on the Link's rolling history of the LAST rate_window_s / listen_s seconds instead of waiting for new ones (only when the
+  // history is long enough; otherwise it falls back to the forward windows). Used by the F1+F3 check on a warm (start-up) Link; the take-over (acquire) always uses forward, real-time windows.
+  bool preflight(std::vector<PreflightItem>& out, double listen_s = -1, double rate_window_s = 1.0, bool retro = false);
   bool acquire(bool fast);
   bool write(const Vec& q_t, const Vec& kp, const Vec& kd, double dt);  // true if a command went out in NORMAL mode
   void heartbeat() { heartbeat_ = mono(); }
@@ -95,6 +98,7 @@ class ControlSession {
   bool quit_requested() const { return quit_; }
   std::atomic<bool>& quit_flag() { return quit_; }  // for signal handlers (lock-free atomic store is async-signal-safe)
   bool remote_fired() const { return rf_->fired.load() > 0; }
+  void reset_remote_flags() { rf_->fired.store(0); rf_->l2b_fired.store(0); }  // V1.5.1: a pre-warmed runner idled before the trigger: remote events from that time must not abort the run
   bool exit_triggered() const { return exec_.submitted(); }
   Mode mode() const { return (Mode)mode_.load(); }
   int entry_fsm() const { return entry_fsm_; }
@@ -107,9 +111,24 @@ class ControlSession {
   const Vec& last_cmd_q() const { return last_q_; }
   bool has_last_cmd() const { return have_last_; }
   SafetyGuard& guard() { return guard_; }
+  // ---- P5.1 logging hooks (all optional; nullptr = off). The logger must outlive the session.
+  void set_logger(RunLogger* l);
+  void set_tick(int n, double t_rel) { cur_tick_ = n; cur_t_rel_ = t_rel; }
+  const CmdOut& last_out() const { return last_out_; }       // the last command transmitted by write() (after the safety guard)
+  const FilterTrace& last_trace() const { return ftr_; }     // per-joint clip stages of that command
+  double max_tilt_seen() const { return std::max(main_mon_.max_tilt, watch_mon_.max_tilt); }  // P5.3: includes the trigger sample
+  double max_gyro_xy_seen() const { return std::max(main_mon_.max_gyro_xy, watch_mon_.max_gyro_xy); }
+  // V1.6 A1: reference-aware instability judge. The control loop publishes the pelvis quaternion of the CURRENT reference frame once per tick (valid = the dance reference is running: not lead-in / paused / hold).
+  void set_reference(bool valid, const std::array<float, 4>& q_wxyz, uint64_t tick) { ref_.set(valid, q_wxyz, mono(), tick); }
+  void invalidate_reference() { ref_.invalidate(mono()); }
+  std::string tilt_judge_json() const { return pm::tilt_judge_json(cfg_.exit, main_mon_, watch_mon_); }
+  uint32_t last_clip_n() const { return (uint32_t)ftr_.n_clipped; }
+  uint32_t last_clip_mask() const { return ftr_.any_mask; }
 
  private:
-  void send_raw(const Vec& q, const Vec& dq, const Vec& tau, const Vec& kp, const Vec& kd);
+  void send_raw(const Vec& q, const Vec& dq, const Vec& tau, const Vec& kp, const Vec& kd, uint8_t kind = FK_POLICY);
+  void log_frame(uint8_t kind, const Vec& q_cmd, const Vec& kp, const Vec& kd, double send_us);
+  void log_clip_rows(const FilterTrace& ft, const Vec& q_meas, int tick, uint8_t phase, std::vector<ClipRow>* rows);
   void exit_frame(FrameKind k, const Vec& q_snapshot);
   void start_threads();
   void watch_loop();
@@ -140,14 +159,22 @@ class ControlSession {
     DampCombo l2b;
     std::atomic<double> tm{0}, t_l2b{0};
     std::atomic<double> arrival{0};
+    std::atomic<RunLogger*> log{nullptr};  // P5.1: DDS-thread remote-controller events (key changes, START x2, L2+B)
+    std::atomic<uint32_t> prev_keys{0};
   };
   std::shared_ptr<RemoteFlag> rf_;  // shared with the DDS-thread listener (the Link may outlive the session)
   bool finished_ = false;
   ExitReport exit_report_;
   std::atomic<int> fsm_bad_{0};
   ExitExecutor exec_;
+  RefChannel ref_;  // V1.6 A1: reference attitude (set by the control loop, read by both monitors)
   StabilityMonitor main_mon_, watch_mon_;
   std::atomic<double> last_state_arrival_{0};
+  RunLogger* log_ = nullptr;
+  std::atomic<int> cur_tick_{-1};
+  std::atomic<double> cur_t_rel_{0};
+  FilterTrace ftr_;
+  CmdOut last_out_;
 };
 
 }  // namespace pm

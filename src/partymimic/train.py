@@ -26,6 +26,8 @@ parser.add_argument("--init", type=str, default=None,
                          "optimizers, learning-rate control and reset statistics start fresh")
 parser.add_argument("--iterations", type=int, default=12000)
 parser.add_argument("--ckpt_every", type=int, default=2000)
+parser.add_argument("--last_every", type=int, default=0,
+                    help="YTHN: also write the full resumable state last.pt every this many iterations (0: only at the end)")
 parser.add_argument("--ckpt_minutes", type=float, default=0.0, help="also checkpoint every n minutes of training wall-clock")
 parser.add_argument("--max_hours", type=float, default=None, help="stop after this much training wall-clock")
 parser.add_argument("--log_every", type=int, default=50)
@@ -70,8 +72,27 @@ parser.add_argument("--amp", type=str, default="bf16", choices=["none", "bf16"],
 parser.add_argument("--std_scale", type=float, default=0.6,
                     help="training reward only: scale of the body / root position and orientation kernel widths "
                          "(evaluation keeps SuperMimic's reward)")
+parser.add_argument("--w_target_limit", type=float, default=0.0,
+                    help="YTHN: weight (NEGATIVE = penalty, like w_joint_limit) per rad on the PD target beyond the hard joint limits (deployment guard clamps it); 0 = off")
 parser.add_argument("--contact_reward", type=float, default=0.25,
                     help="weight of the contact-matching / anti-slip reward term in imagination (evaluation reward unchanged)")
+parser.add_argument("--contact_source", type=str, default="legacy", choices=["legacy", "refine"],
+                    help="V1.7: reference foot-contact label of the contact reward: legacy = MotionLib.set_ref_contact (clip-floor quantile + speed); refine = contact_refine sidecar "
+                         "<clip>_contact.npz in --contact_labels (stance / swing, soft stance probability on uncertain frames)")
+parser.add_argument("--contact_labels", type=str, default="", help="V1.7: directory with the <clip>_contact.npz sidecars (pmpipe/contact_refine/labels.py); needed by any option below except legacy defaults")
+parser.add_argument("--contact_feat", type=str, default="ankle", choices=["ankle", "sole"],
+                    help="V1.7: simulated contact indicator c_sim: ankle = ankle-roll-link origin below 4.5 cm (V1.6); sole = lowest sole point below --contact_sole_h (tilt invariant, no flat-foot bias)")
+parser.add_argument("--contact_sole_h", type=float, default=0.012)
+parser.add_argument("--contact_conf_weight", type=float, default=0.0, help="V1.7: r_contact *= (1-cw) + cw*label confidence (0 = off)")
+parser.add_argument("--cr_consist", type=float, default=0.0, help="V1.7 (a) weight: confident-stance sole-on-floor + confident-swing no-drag consistency")
+parser.add_argument("--cr_slip", type=float, default=0.0, help="V1.7 (b) weight: narrow (--cr_slip_std m/s) contact-point speed kernel on stable high-confidence stance")
+parser.add_argument("--cr_slip_std", type=float, default=0.1)
+parser.add_argument("--cr_smooth", type=float, default=0.0, help="V1.7 (c) weight: c_sim change-rate (load-flicker proxy) kernel on stable stance")
+parser.add_argument("--cr_foot_xy", type=float, default=0.0, help="V1.7 (d1) weight: stable-stance foot world XY vs reference footprint (L1, capped 0.5 m)")
+parser.add_argument("--cr_root_l1", type=float, default=0.0, help="V1.7 (d2) weight: root world XY drift, L1 shape capped at 1 m")
+parser.add_argument("--cr_zmp_relax", type=float, default=0.0, help="V1.7 (e): position kernels widen by 1 + x * infeasibility(ZMP margin of the reference) (<= 1 + x)")
+parser.add_argument("--cr_zmp_lo", type=float, default=0.10)
+parser.add_argument("--cr_zmp_hi", type=float, default=0.25)
 parser.add_argument("--fail_reset", type=float, default=0.3,
                     help="share of resets sampled one bin before recent termination points (anti-forgetting of hard clips)")
 parser.add_argument("--div_k", type=int, default=24,
@@ -202,6 +223,7 @@ import partymimic.networks as networks
 import partymimic.rotations as rotations
 from partymimic.networks import Critic, Policy, WorldModel, check_pruned, policy_kwargs
 from partymimic.mirror import Mirror
+from partymimic.contact import ContactCfg, attach_labels
 from partymimic.objective import actor_objective
 from partymimic.mdp import flatten_state
 from partymimic.robot import get_robot
@@ -230,7 +252,9 @@ _rc, _s = RewardCfg(), args.std_scale
 mdp = MDP(kin, motion, torch.tensor(robot.default_joint_pos_list(), device=dev), layout.dim, robot.sensing,
           RewardCfg(body_pos_std=_rc.body_pos_std * _s, body_ori_std=_rc.body_ori_std * _s,
                     root_pos_std=_rc.root_pos_std * _s, root_ori_std=_rc.root_ori_std * _s,
-                    w_wrist=args.wrist_kernel, wrist_std=_rc.body_pos_std * _s * args.wrist_std_mult))
+                    w_wrist=args.wrist_kernel, wrist_std=_rc.body_pos_std * _s * args.wrist_std_mult,
+                    w_target_limit=args.w_target_limit))
+mdp.action_alpha = torch.tensor(robot.action_scale_list(), device=dev)
 pipe = ObsPipeline(robot, mdp, layout, dev, PHYSICS_DT)
 # every update and the collection step run as CUDA graphs: the sensing chain must be stateless
 assert not pipe.stateful, f"{args.robot}: stateful sensing (filters, delays) is not supported"
@@ -396,6 +420,13 @@ FEET = [robot.tracked_bodies.index(b) for b in _FEET] if all(b in robot.tracked_
 mdp.feet = FEET
 assert args.contact_reward == 0 or FEET, "--contact_reward needs foot bodies (g1)"
 motion.set_ref_contact(FEET)
+mdp.ccfg = ContactCfg(source=args.contact_source, feat=args.contact_feat, sole_h=args.contact_sole_h, conf_weight=args.contact_conf_weight, w_consist=args.cr_consist,
+                      w_slip=args.cr_slip, slip_std=args.cr_slip_std, w_smooth=args.cr_smooth, w_foot_xy=args.cr_foot_xy, w_root_l1=args.cr_root_l1, zmp_relax=args.cr_zmp_relax, zmp_lo=args.cr_zmp_lo, zmp_hi=args.cr_zmp_hi)
+if mdp.ccfg.needs_labels or mdp.ccfg.feat == "sole":
+    assert FEET and args.contact_labels, "--contact_source refine / --contact_feat sole / --cr_* need foot bodies and --contact_labels"
+    CONTACT_LABEL_META = attach_labels(motion, args.contact_labels, FEET, robot.mjcf_path, mdp.ccfg)
+    mdp.sole_loc, mdp.sole_r = torch.tensor(motion.sole_loc, dtype=torch.float32, device=dev), motion.sole_r
+    print("contact labels:", json.dumps(CONTACT_LABEL_META), "| cfg:", mdp.ccfg, flush=True)
 
 
 def _wm_err(S_hat, s1, mask):
@@ -1351,6 +1382,21 @@ for it in range(start_it, args.iterations):
         path = os.path.join(args.log_dir, f"ckpt_{it + 1:06d}.pt")
         torch.save(small, path + ".tmp")
         os.replace(path + ".tmp", path)
+    if args.last_every and not final_ck and (it + 1) % args.last_every == 0:
+        ckpt_wait(drain=True)
+        ck = {"wm": wm.state_dict(), "pi": pi_avg.module.state_dict() if pi_avg is not None else pi_l.state_dict(), "pi_live": pi_l.state_dict(), "critic": critic.state_dict(),
+              "opt_wm": opt_wm.state_dict(), "opt_pi": opt_pi.state_dict(), "opt_v": opt_v.state_dict(), "iteration": it + 1,
+              "wall_time": time.time() - t_start, "sim_steps": sim_steps, "args": vars(args),
+              "pi_avg": pi_avg.state_dict() if pi_avg is not None else None,
+              "saved_at": time.strftime("%Y-%m-%d %H:%M:%S")}  # fmt: skip
+        ck["ctrl"] = {"decay_at": DECAY_AT[0],
+                      "env_bins": {"bin_G": env.bin_G.cpu(), "bin_fail": env.bin_fail.cpu(), "bin_w_avg": env.bin_w_avg.cpu()}}  # fmt: skip
+        if ALLOC is not None:
+            ck["ctrl"]["alloc"] = ALLOC.state_dict()
+        last = os.path.join(args.log_dir, "last.pt")
+        torch.save(ck, last + ".tmp")
+        os.replace(last + ".tmp", last)
+        del ck
     if out_of_time:
         print(f"time budget of {args.max_hours} h reached at it {it + 1}", flush=True)
         break

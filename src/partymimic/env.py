@@ -439,6 +439,9 @@ class TrackingSim:
         a_prev = self.a_prev.clone()
         ep_step = self.ep_step.clone()
         target = self.default_q + xi[:, 1 : 1 + self.J] + self.alpha * a
+        if self.spec.dr.target_clip is not None:  # deployment guard semantics: the target never leaves the hard joint limits
+            m_ = self.spec.dr.target_clip
+            target = torch.clamp(target, self.mdp.kin.q_lo + m_, self.mdp.kin.q_hi - m_)
         use_delay = self.spec.dr.cmd_delay[1] > 0
         prev_t = self.prev_target.clone() if use_delay else None
         if not use_delay:

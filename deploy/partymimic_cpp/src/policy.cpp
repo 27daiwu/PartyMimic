@@ -64,6 +64,46 @@ bool Motion::load(const std::string& path, Motion& o, std::string& err) {
   return true;
 }
 
+Motion Motion::with_lead_in(int n) const {
+  Motion o;
+  o.fps = fps;
+  if (n <= 0 || T <= 0) { o = *this; return o; }
+  o.T = T + n;
+  auto pad = [&](const std::vector<float>& v, size_t w) {
+    std::vector<float> r;
+    r.reserve(v.size() + (size_t)n * w);
+    for (int i = 0; i < n; i++) r.insert(r.end(), v.begin(), v.begin() + (long)w);
+    r.insert(r.end(), v.begin(), v.end());
+    return r;
+  };
+  o.jp = pad(jp, N); o.jv = pad(jv, N); o.rp = pad(rp, 3); o.rq = pad(rq, 4);
+  return o;
+}
+
+RunTimeline plan_timeline(const Motion& motion, bool running, double run_s, double lead_in_s, double end_hold_s, double dt) {
+  RunTimeline t;
+  t.running = running; t.fps = motion.fps; t.dt = dt; t.run_s = run_s; t.end_hold_s = end_hold_s;
+  t.dance_frames = motion.T;
+  t.dance_s = motion.fps > 0 ? motion.T / (double)motion.fps : 0;
+  t.lead_in_frames = running ? (int)std::lround(lead_in_s * motion.fps) : 0;
+  t.lead_in_s = t.lead_in_frames / (double)motion.fps;
+  t.clip_frames = motion.T + t.lead_in_frames;
+  if (running) {
+    t.seg_frames = std::min(t.clip_frames - 1, t.lead_in_frames + (int)std::lround(run_s * motion.fps));
+    t.window_over_tick = std::max(0, t.seg_frames - 1);  // PolicyStack::tick advances motion_t first: tick n sees motion_t = min(n + 1, T - 1)
+    t.planned_total_s = t.window_over_tick * dt + end_hold_s;
+    t.covers_whole_dance = t.seg_frames == t.clip_frames - 1;
+    t.last_frame_held = t.covers_whole_dance && end_hold_s > 0;
+  } else {
+    t.seg_frames = std::min(t.clip_frames - 1, (int)std::lround(run_s * motion.fps));
+    t.window_over_tick = (int)std::ceil(run_s / dt - 1e-9);
+    t.planned_total_s = run_s;  // paused: the hand-back starts as soon as the window is over (no extra hold)
+  }
+  t.failsafe_s = t.lead_in_s + run_s + end_hold_s + 1.0;
+  t.margin_s = t.failsafe_s - t.planned_total_s;
+  return t;
+}
+
 // ------------------------------------------------------------------ quaternion helpers (wxyz), identical formulas to sim2real/utils/math.py
 namespace {
 template <typename T> using Q = std::array<T, 4>;
@@ -184,6 +224,7 @@ struct PolicyStack::Impl {
   std::vector<float> hist_quat;     // [history][8]
   std::array<double, 4> offset{1, 0, 0, 0};
   std::vector<float> ref_jp, ref_root;  // current slice (12 steps)
+  PolicyResetInfo rinfo;
 };
 
 static constexpr int PROPRIO_DIM = 2 * N + 6 + N;  // 93
@@ -269,6 +310,37 @@ void PolicyStack::reset(const RobotSample& s, bool paused) {
   quat_frame(m_, I.offset, s, ref_idx, qf);
   for (int h = 0; h < p_.history; h++) std::memcpy(&I.hist_quat[(size_t)h * 8], qf, 8 * sizeof(float));
   I.paused = paused;
+  I.rinfo.yaw_offset = {I.offset[0], I.offset[1], I.offset[2], I.offset[3]};
+  I.rinfo.motion_t = 0;
+  I.rinfo.paused = paused;
+  I.rinfo.sample = s;
+}
+
+int PolicyStack::obs_dim() const { return (int)(impl_->hist_proprio.size() + impl_->hist_quat.size() + impl_->ref_jp.size() + impl_->ref_root.size()); }
+void PolicyStack::copy_obs(float* dst) const {
+  const Impl& I = *impl_;
+  for (const std::vector<float>* v : {&I.hist_proprio, &I.hist_quat, &I.ref_jp, &I.ref_root}) {
+    std::memcpy(dst, v->data(), v->size() * sizeof(float));
+    dst += v->size();
+  }
+}
+std::vector<std::pair<std::string, int>> PolicyStack::obs_layout() const {
+  const Impl& I = *impl_;
+  return {{"proprio", (int)I.hist_proprio.size()}, {"root_quat_hist", (int)I.hist_quat.size()}, {"ref_joint_pos", (int)I.ref_jp.size()}, {"ref_root", (int)I.ref_root.size()}};
+}
+PolicyResetInfo PolicyStack::reset_info() const { return impl_->rinfo; }
+PolicyStack::StateDigest PolicyStack::state_digest() const {
+  const Impl& I = *impl_;
+  StateDigest d;
+  d.motion_t = I.motion_t; d.paused = I.paused;
+  for (float v : I.prev_action) d.prev_action_abs_max = std::max(d.prev_action_abs_max, (double)std::fabs(v));
+  const size_t P = PROPRIO_DIM;
+  d.history_identical = true;
+  for (int h = 1; h < p_.history; h++) d.history_identical = d.history_identical && std::memcmp(&I.hist_proprio[0], &I.hist_proprio[(size_t)h * P], P * sizeof(float)) == 0;
+  d.quat_history_identical = true;
+  for (int h = 1; h < p_.history; h++) d.quat_history_identical = d.quat_history_identical && std::memcmp(&I.hist_quat[0], &I.hist_quat[(size_t)h * 8], 8 * sizeof(float)) == 0;
+  d.ref_slice_first = 0;
+  return d;
 }
 
 PolicyOut PolicyStack::tick(const RobotSample& s) {
@@ -288,6 +360,17 @@ PolicyOut PolicyStack::tick(const RobotSample& s) {
   int ref_idx = clampi(I.motion_t + (paused ? 0 : -1), 0, m_.T - 1);
   quat_frame(m_, I.offset, s, ref_idx, &I.hist_quat[(size_t)(p_.history - 1) * 8]);
 
+  PolicyOut r;
+  r.action_prev = I.prev_action;
+  {  // reference at step 0 of this tick (the paused slice and the running slice both have step 0 at motion_t)
+    int idx = clampi(I.motion_t, 0, m_.T - 1);
+    r.ref_idx = idx;
+    std::memcpy(r.ref_jp.data(), &m_.jp[(size_t)idx * N], N * sizeof(float));
+    std::memcpy(r.ref_jv.data(), &m_.jv[(size_t)idx * N], N * sizeof(float));
+    std::memcpy(r.ref_rp.data(), &m_.rp[(size_t)idx * 3], 3 * sizeof(float));
+    std::memcpy(r.ref_rq.data(), &m_.rq[(size_t)idx * 4], 4 * sizeof(float));
+  }
+
   // ---- inference
   std::array<int64_t, 1> sh0 = {(int64_t)I.hist_proprio.size()}, sh1 = {(int64_t)I.hist_quat.size()}, sh2 = {(int64_t)I.ref_jp.size()}, sh3 = {(int64_t)I.ref_root.size()};
   std::vector<Ort::Value> in;
@@ -299,7 +382,6 @@ PolicyOut PolicyStack::tick(const RobotSample& s) {
   const char* outn[1] = {"action"};
   double t0 = mono();
   auto out = I.sess->Run(Ort::RunOptions{nullptr}, names, in.data(), 4, outn, 1);
-  PolicyOut r;
   r.infer_ms = 1e3 * (mono() - t0);
   const float* a = out[0].GetTensorData<float>();
   size_t na = out[0].GetTensorTypeAndShapeInfo().GetElementCount();

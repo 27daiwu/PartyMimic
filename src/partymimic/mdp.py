@@ -10,6 +10,7 @@ from dataclasses import dataclass
 
 import torch
 
+from .contact import ContactCfg
 from .kinematics import Kinematics
 from .motion import CONTROL_DT, SPARSE5_ERR, MotionLib
 from .rotations import mat_to_6d, mm3, mv3, quat_to_mat, mat_to_quat, rot_angle_sq, so3_log, yaw_mat
@@ -56,6 +57,10 @@ class RewardCfg:
     term_tilt: float = 0.8
     w_wrist: float = 0.0
     wrist_std: float = 0.05
+    w_target_limit: float = 0.0
+    """YTHN opt-in: penalty (per rad, summed over joints) on the part of the PD target default + alpha * a that lies beyond the
+    hard joint limits (less target_margin): the deployed guard clamps those targets, so the torque they promise is never sent."""
+    target_margin: float = 0.005
     """--wrist_kernel: extra position kernel w_wrist exp(-e / wrist_std^2) on the wrists (e: mean squared error)."""
 
 
@@ -112,6 +117,10 @@ class MDP:
         assert cfg.w_wrist == 0 or len(self.wrists) == 2, self.wrists
         # InstantTrack contact reward (training only): tracked-body indices of the feet, set by the trainer
         self.feet: list[int] = []
+        self.action_alpha: torch.Tensor | None = None  # action scale per joint (rad); set by the trainer for --w_target_limit
+        self.ccfg = ContactCfg()  # V1.7 (C2) contact-aware options; the default is the V1.6 reward bit for bit
+        self.sole_loc: torch.Tensor | None = None  # (2, 14, 3) sole sample points in the ankle frame (set with the labels)
+        self.sole_r = 0.01
 
     # ---------------- observation ----------------
     def obs(self, S, a_prev, xi, f) -> torch.Tensor:
@@ -163,13 +172,20 @@ class MDP:
         e_av = ((m.body_w[f] - bw) ** 2).sum(-1).mean(-1)
         e_rp = ((rp - p) ** 2).sum(-1)
         e_ro = rot_angle_sq(rR, R)
+        cc = self.ccfg
+        if cc.zmp_relax > 0 and w_contact > 0:  # (e) training reward only (like the contact term); widen the body / root POSITION kernels where the reference is dynamically infeasible (capped, never dropped)
+            zs = 1 + cc.zmp_relax * m.ref_infeas[f]
+            zs2 = zs * zs
+        else:
+            zs2 = 1.0
+
         def track(c):
             return (
-                torch.exp(-e_pos / c.body_pos_std**2)
+                torch.exp(-e_pos / (c.body_pos_std**2 * zs2))
                 + torch.exp(-e_ori / c.body_ori_std**2)
                 + torch.exp(-e_lv / c.body_linvel_std**2)
                 + torch.exp(-e_av / c.body_angvel_std**2)
-                + 0.5 * torch.exp(-e_rp / c.root_pos_std**2)
+                + 0.5 * torch.exp(-e_rp / (c.root_pos_std**2 * zs2))
                 + 0.5 * torch.exp(-e_ro / c.root_ori_std**2)
             )
 
@@ -180,14 +196,46 @@ class MDP:
         r_rate = ((a - a_prev) ** 2).sum(-1)
         r_lim = (torch.relu(q - self.soft_hi) + torch.relu(self.soft_lo - q)).sum(-1)
         r = (r_track + c.w_action_rate * r_rate + c.w_joint_limit * r_lim) * CONTROL_DT
+        if c.w_target_limit != 0.0:
+            tgt = self.default_q + self.action_alpha * a
+            r_tl = (torch.relu(tgt - (self.kin.q_hi - c.target_margin)) + torch.relu((self.kin.q_lo + c.target_margin) - tgt)).sum(-1)
+            r = r + c.w_target_limit * r_tl * CONTROL_DT
         if w_contact > 0:
             fz, rz = bp[..., self.feet, 2], m.body_p[f][..., self.feet, 2]
-            c_sim = torch.sigmoid((CONTACT_Z - fz) / 0.005)
             rc = getattr(m, "ref_contact", None)  # MotionLib.set_ref_contact (set by the trainer), else the fixed 4.5 cm
-            c_ref = rc[f] if rc is not None else (rz < CONTACT_Z).float()
+            if cc.source == "refine":  # V1.7: contact_refine stance / swing (soft on uncertain frames)
+                c_ref = m.ref_contact_refine[f]
+            else:
+                c_ref = rc[f] if rc is not None else (rz < CONTACT_Z).float()
             slip = (bv[..., self.feet, :2] ** 2).sum(-1)
+            need_sole = cc.feat == "sole" or cc.terms
+            if need_sole:
+                hs, vpt, vzpt = self._sole_state(bp, bR, bv, bw)
+            if cc.feat == "sole":  # tilt-invariant: lowest sole point (the ankle-origin height is ~35 mm + heel/toe geometry)
+                c_sim = torch.sigmoid((cc.sole_h - hs) / cc.sole_tau)
+            else:
+                c_sim = torch.sigmoid((CONTACT_Z - fz) / 0.005)
             r_contact = (1 - (c_sim - c_ref) ** 2) + c_ref * torch.exp(-slip / 0.3**2)
+            if cc.conf_weight > 0:  # uncertain / inferred frames count less (soft label)
+                r_contact = r_contact * ((1 - cc.conf_weight) + cc.conf_weight * m.ref_conf[f])
             r = r + w_contact * r_contact.mean(-1) * CONTROL_DT
+            if cc.terms:
+                st, sw, sb = m.ref_hi_stance[f], m.ref_hi_swing[f], m.ref_stable[f]
+                if cc.w_consist != 0:  # (a) confident stance: sole on the floor; confident swing: not dragged below the reference foot
+                    drag = torch.relu(m.ref_sole_h[f] - hs - 0.005)
+                    r_a = st * c_sim + sw * torch.exp(-((drag / 0.01) ** 2))
+                    r = r + cc.w_consist * r_a.mean(-1) * CONTROL_DT
+                if cc.w_slip != 0:  # (b) narrow kernel on the horizontal speed of the contact point, stable stance only
+                    r = r + cc.w_slip * (sb * torch.exp(-(vpt / cc.slip_std) ** 2)).mean(-1) * CONTROL_DT
+                if cc.w_smooth != 0:  # (c) d c_sim / dt of a planted foot (load flicker proxy), stable stance only
+                    dcdt = c_sim * (1 - c_sim) / cc.sole_tau * vzpt
+                    r = r + cc.w_smooth * (sb * torch.exp(-((dcdt / cc.smooth_std) ** 2))).mean(-1) * CONTROL_DT
+                if cc.w_foot_xy != 0:  # (d1) stable-stance foot vs the reference footprint in the WORLD frame (L1, capped: gradient does not vanish)
+                    e_f = (bp[..., self.feet, :2] - m.body_p[f][..., self.feet, :2]).norm(dim=-1)
+                    r = r - cc.w_foot_xy * (sb * (e_f / cc.foot_cap).clamp(max=1.0)).mean(-1) * CONTROL_DT
+            if cc.w_root_l1 != 0:  # (d2) world-frame root XY drift against the (consistent) reference root, L1 capped
+                e_x = (p[..., :2] - rp[..., :2]).norm(dim=-1)
+                r = r - cc.w_root_l1 * (e_x / cc.root_cap).clamp(max=1.0) * CONTROL_DT
         if terms:
             return r, {
                 "track": r_track * CONTROL_DT,
@@ -198,6 +246,19 @@ class MDP:
                 "joint_limit": r_lim,
             }
         return r
+
+    def _sole_state(self, bp, bR, bv, bw):
+        """Per foot: lowest sole point height [m], its horizontal speed and vertical velocity (rigid-body velocity of that point; ankle-link origin velocity + w x r)."""
+        F = self.feet
+        loc = self.sole_loc  # (2,14,3)
+        R = bR[..., F, :, :]  # (...,2,3,3)
+        off = torch.einsum("...fij,fpj->...fpi", R, loc)  # (...,2,14,3) sample offsets in the world frame
+        z = bp[..., F, 2].unsqueeze(-1) + off[..., 2]
+        k = z.argmin(-1, keepdim=True)  # (...,2,1)
+        h = z.gather(-1, k).squeeze(-1) - self.sole_r
+        o = off.gather(-2, k.unsqueeze(-1).expand(*k.shape, 3)).squeeze(-2)  # (...,2,3) offset of the lowest point
+        v = bv[..., F, :] + torch.cross(bw[..., F, :], o, dim=-1)
+        return h, v[..., :2].norm(dim=-1), v[..., 2]
 
     def termination(self, S, f) -> torch.Tensor:
         p, R = S[0], S[1]

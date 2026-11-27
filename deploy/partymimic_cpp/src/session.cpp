@@ -15,7 +15,9 @@ namespace pm {
 bool ExclusiveLock::acquire(const std::string& path) {
   fd_ = ::open(path.c_str(), O_RDWR | O_CREAT, 0666);
   if (fd_ < 0) { holder = "cannot open lock file"; return false; }
-  if (::flock(fd_, LOCK_EX | LOCK_NB) != 0) {
+  int lk = ::flock(fd_, LOCK_EX | LOCK_NB);
+  for (int i = 0; lk != 0 && i < 3; i++) { ::usleep(1000); lk = ::flock(fd_, LOCK_EX | LOCK_NB); }   // a concurrent probe (guardian / service / runner GO_WAIT) holds the flock for microseconds only
+  if (lk != 0) {
     char b[300] = {0};
     ssize_t n = ::pread(fd_, b, sizeof b - 1, 0);
     holder = n > 0 ? std::string(b, (size_t)n) : "";
@@ -66,7 +68,14 @@ LockInfo lock_probe(const std::string& path) {
     p = strstr(b, "exit_t=");
     if (p) li.exit_t = atof(p + 7);
   }
-  if (::flock(fd, LOCK_EX | LOCK_NB) == 0) { ::flock(fd, LOCK_UN); li.held = false; } else li.held = true;
+  // V1.6 integration fix: another PROBE (runner GO_WAIT loop, guardian 10 ms poll, service) holds the flock for microseconds while it tests it -> a single failed try is NOT "held".
+  // A false "held" together with the STALE record of the previous run (exit_phase DONE) made a fresh guardian "arm" on the old pid and end as "normal end" -> service: guardian died -> take-over cancelled.
+  // A real holder keeps failing: 3 tries 1 ms apart (costs <= 2 ms only while the lock really is held).
+  li.held = true;
+  for (int i = 0; i < 3; i++) {
+    if (::flock(fd, LOCK_EX | LOCK_NB) == 0) { ::flock(fd, LOCK_UN); li.held = false; break; }
+    if (i < 2) ::usleep(1000);
+  }
   ::close(fd);
   return li;
 }
@@ -83,20 +92,61 @@ ControlSession::ControlSession(Link& link, SafetyGuard& guard, const SessionConf
               return decide_exit(x, cfg_.exit).mode == "PASSIVE" ? "PASSIVE" : "";
             },
             [this]() { return file_exists(cfg_.estop_file) || rf_->l2b_fired.load() > 0; }),
-      main_mon_(cfg.exit), watch_mon_(cfg.exit) {
+      main_mon_(cfg.exit, &ref_, "control_loop"), watch_mon_(cfg.exit, &ref_, "watch_3ms") {
   last_q_.setZero(); last_dq_.setZero(); last_tau_.setZero(); last_kp_.setZero(); last_kd_.setConstant(DAMP_KD);
   hold_kp_.setZero(); hold_kd_.setConstant(DAMP_KD);
   rf_ = std::make_shared<RemoteFlag>();
   rf_->dbl = StartDoubleClick(cfg_.remote_window_s);
   rf_->l2b = DampCombo(cfg_.exit.l2b_hold_s);
   auto rf = rf_;
-  link_.add_state_listener([rf](const LinkState& st) {  // DDS reader thread: only sets flags
+  link_.add_state_listener([rf](const LinkState& st) {  // DDS reader thread: sets flags (+ P5.1: remote-controller events into the run log, only on a change)
     uint16_t keys = keys_from_wireless(st.wireless);
-    if (rf->dbl.feed(st.arrival, start_pressed(keys)) && rf->fired.load() == 0) { rf->tm = mono(); rf->fired.store(1); }
-    if (rf->l2b.feed(st.arrival, keys, rf->active.load()) && rf->l2b_fired.load() == 0) { rf->t_l2b = mono(); rf->l2b_fired.store(1); }
+    RunLogger* lg = rf->log.load();
+    if (lg && keys != rf->prev_keys.exchange(keys)) {
+      char b[200];
+      snprintf(b, sizeof b, "\"keys\":%u,\"text\":\"%s\",\"byte2\":%u,\"byte3\":%u,\"control_active\":%s", (unsigned)keys, keys_text(keys).c_str(), st.wireless[2], st.wireless[3], rf->active.load() ? "true" : "false");
+      lg->event_at(st.arrival, "remote_keys", b);
+    }
+    if (rf->dbl.feed(st.arrival, start_pressed(keys)) && rf->fired.load() == 0) {
+      rf->tm = mono(); rf->fired.store(1);
+      if (lg) lg->event_at(st.arrival, "remote_start_double_click", std::string("\"control_active\":") + (rf->active.load() ? "true" : "false"));
+    }
+    if (rf->l2b.feed(st.arrival, keys, rf->active.load()) && rf->l2b_fired.load() == 0) {
+      rf->t_l2b = mono(); rf->l2b_fired.store(1);
+      if (lg) lg->event_at(st.arrival, "remote_l2b_emergency", "\"control_active\":true");
+    }
   });
 }
-ControlSession::~ControlSession() { cleanup(); }
+ControlSession::~ControlSession() { cleanup(); rf_->log.store(nullptr); }
+
+void ControlSession::set_logger(RunLogger* l) {
+  log_ = l;
+  rf_->log.store(l);
+  exec_.set_log([this](const std::string& k, const std::string& f) { event(k, f); });
+}
+
+void ControlSession::log_frame(uint8_t kind, const Vec& q_cmd, const Vec& kp, const Vec& kd, double send_us) {
+  if (!log_) return;
+  FrameRec f;
+  f.t_mono = mono(); f.kind = kind; f.send_us = (float)send_us;
+  auto st = link_.latest();
+  if (st) { f.state_seq = st->seq; for (int i = 0; i < N; i++) f.q_meas[i] = (float)st->q[i]; }
+  for (int i = 0; i < N; i++) { f.q_cmd[i] = (float)q_cmd[i]; f.kp[i] = (float)kp[i]; f.kd[i] = (float)kd[i]; }
+  log_->frame(f);
+}
+
+void ControlSession::log_clip_rows(const FilterTrace& ft, const Vec& q_meas, int tick, uint8_t phase, std::vector<ClipRow>* rows) {
+  if (!ft.any_mask) return;
+  for (int i = 0; i < N; i++) {
+    if (!ft.mask[i]) continue;
+    ClipRow c;
+    c.t_mono = mono(); c.t_rel = cur_t_rel_.load(); c.tick = tick; c.phase = phase; c.joint = i; c.mask = ft.mask[i];
+    c.raw = ft.raw[i]; c.after_pos = ft.after_pos[i]; c.after_slew = ft.after_slew[i]; c.after_torque = ft.after_torque[i]; c.final_q = ft.final_q[i];
+    c.lo = ft.lo[i]; c.hi = ft.hi[i]; c.prev_target = ft.prev_target[i]; c.slew_step = ft.slew_step[i]; c.tau_pre_nm = ft.tau_pre_nm[i]; c.tau_lim_nm = ft.tau_lim_nm[i]; c.q_meas = q_meas[i];
+    if (rows) rows->push_back(c);
+    if (log_) log_->clip(c);
+  }
+}
 
 void ControlSession::event(const std::string& kind, const std::string& fields) {
   logf("[session] {\"t\":%.4f,\"kind\":\"%s\"%s%s}", now(), kind.c_str(), fields.empty() ? "" : ",", fields.c_str());
@@ -114,36 +164,50 @@ Fault ControlSession::check_state_once(const StatePtr& st) {
   if (f != Fault::NONE) { emergency(f, guard_.events().back().detail); return f; }
   if (st && (mode_ == NORMAL || mode_ == ACQUIRE)) {  // control-loop copy of the stability detector (the 3 ms watch thread has the same one)
     Stability sv = main_mon_.update(*st);
-    if (sv == Stability::FALLEN) { trigger_exit(Fault::TILT, main_mon_.detail(), mono(), st->arrival); return Fault::TILT; }
-    if (sv == Stability::UNSTABLE) { trigger_exit(Fault::UNSTABLE, main_mon_.detail(), mono(), st->arrival); return Fault::UNSTABLE; }
+    if (sv == Stability::FALLEN) { trigger_exit(Fault::TILT, main_mon_.detail(), mono(), st->arrival); event("tilt_judge_trigger", main_mon_.trigger_json()); return Fault::TILT; }
+    if (sv == Stability::UNSTABLE) { trigger_exit(Fault::UNSTABLE, main_mon_.detail(), mono(), st->arrival); event("tilt_judge_trigger", main_mon_.trigger_json()); return Fault::UNSTABLE; }
   }
   return f;
 }
 
-bool ControlSession::preflight(std::vector<PreflightItem>& res, double listen_s, double rate_window_s) {
+bool ControlSession::preflight(std::vector<PreflightItem>& res, double listen_s, double rate_window_s, bool retro) {
   res.clear();
   auto add = [&](const std::string& n, int level, const std::string& d = "") { res.push_back({n, level, d}); };
   char b[256];
+  const double listen_w = listen_s >= 0 ? listen_s : cfg_.foreign_writer_listen_s;
   // 1. stream alive (FAIL = communication interrupted) and fast enough (WARN: slow but alive; the in-run guard still trips at 60 ms staleness)
-  double t_end = mono() + rate_window_s;
-  struct S { double t; uint64_t seq; uint32_t tick; };
-  std::vector<S> seqs;
-  while (mono() < t_end) {
-    auto st = link_.latest();
-    if (st) seqs.push_back({mono(), st->seq, st->tick});
-    sleep_s(0.005);
+  WindowStats rw;
+  const bool retro_rate = retro && (rw = link_.window(rate_window_s)).covered;
+  const bool retro_listen = retro && link_.window(listen_w).covered;
+  const double t_listen0 = mono();
+  const uint64_t n_listen0 = link_.cmd_rx_count();  // the foreign-writer window runs CONCURRENTLY with the stream-rate window (same length, ends at item 4 below)
+  double rate = 0;
+  size_t nd = 0;
+  if (retro_rate) {
+    if (rw.ls_rx == 0) { add("lowstate_stream", L_FAIL, "no rt/lowstate sample within the window (communication interrupted)"); return false; }
+    rate = rw.ls_hz; nd = rw.distinct_ticks;
+  } else {
+    double t_end = mono() + rate_window_s;
+    struct S { double t; uint64_t seq; uint32_t tick; };
+    std::vector<S> seqs;
+    while (mono() < t_end) {
+      auto st = link_.latest();
+      if (st) seqs.push_back({mono(), st->seq, st->tick});
+      sleep_s(0.005);
+    }
+    if (seqs.empty()) { add("lowstate_stream", L_FAIL, "no rt/lowstate sample within the window (communication interrupted)"); return false; }
+    rate = (double)(seqs.back().seq - seqs.front().seq) / std::max(1e-6, seqs.back().t - seqs.front().t);
+    std::vector<uint32_t> ticks;
+    for (auto& s : seqs) ticks.push_back(s.tick);
+    std::sort(ticks.begin(), ticks.end());
+    nd = std::unique(ticks.begin(), ticks.end()) - ticks.begin();
   }
-  if (seqs.empty()) { add("lowstate_stream", L_FAIL, "no rt/lowstate sample within the window (communication interrupted)"); return false; }
-  double rate = (double)(seqs.back().seq - seqs.front().seq) / std::max(1e-6, seqs.back().t - seqs.front().t);
-  std::vector<uint32_t> ticks;
-  for (auto& s : seqs) ticks.push_back(s.tick);
-  std::sort(ticks.begin(), ticks.end());
-  size_t nd = std::unique(ticks.begin(), ticks.end()) - ticks.begin();
-  snprintf(b, sizeof b, "%.0f Hz (min %.0f)", rate, cfg_.min_state_hz);
+  snprintf(b, sizeof b, "%.0f Hz (min %.0f)%s", rate, cfg_.min_state_hz, retro_rate ? " [rolling history, last window]" : "");
   add("lowstate_rate_hz", rate >= cfg_.min_state_hz ? L_PASS : (rate >= 15 ? L_WARN : L_FAIL), b);
   snprintf(b, sizeof b, "%zu distinct ticks", nd);
   add("lowstate_tick_advancing", nd > 5 ? L_PASS : (nd > 1 ? L_WARN : L_FAIL), b);
   auto st = link_.latest();
+  if (!st) { add("lowstate_stream", L_FAIL, "no rt/lowstate sample"); return false; }
   // 2. guard on a live sample (on a throw-away copy: does not latch the real guard)
   SafetyGuard g = guard_;
   Fault f = g.check_state(st->q, st->dq, st->tau, st->quat, st->gyro, false, 0, mono() - st->arrival, 0.0);
@@ -176,11 +240,15 @@ bool ControlSession::preflight(std::vector<PreflightItem>& res, double listen_s,
   snprintf(b, sizeof b, "lowstate.mode_machine=%d expected 5 (0 = simulation, as in the official check_mode_machine)", st->mode_machine);
   add("mode_machine_matches", (st->mode_machine == 0 || st->mode_machine == 5) ? L_PASS : L_FAIL, b);
   // 4. a foreign controller ACTIVELY writing the user command topic
-  uint64_t n0 = link_.cmd_rx_count();
-  sleep_s(listen_s >= 0 ? listen_s : cfg_.foreign_writer_listen_s);
-  uint64_t n1 = link_.cmd_rx_count();
-  snprintf(b, sizeof b, "%llu samples in listen window", (unsigned long long)(n1 - n0));
-  add("no_active_writer_on_user_lowcmd", n1 == n0 ? L_PASS : L_FAIL, b);
+  uint64_t n_user;
+  if (retro_listen) n_user = link_.window(listen_w).user_cmd;
+  else {
+    const double rest = listen_w - (mono() - t_listen0);
+    if (rest > 0) sleep_s(rest);
+    n_user = link_.cmd_rx_count() - n_listen0;
+  }
+  snprintf(b, sizeof b, "%llu samples in listen window (%.1f s%s)", (unsigned long long)n_user, listen_w, retro_listen ? ", rolling history" : "");
+  add("no_active_writer_on_user_lowcmd", n_user == 0 ? L_PASS : L_FAIL, b);
   // 5. exclusive lock availability, e-stop latch
   LockInfo li = lock_probe(cfg_.lock_path);
   add("exclusive_lock_free", li.held ? L_FAIL : L_PASS, li.held ? "held by pid " + std::to_string(li.pid) : "");
@@ -237,7 +305,7 @@ bool ControlSession::acquire(bool fast) {
   link_.enable_write();
   // frame streamed while switching: measured q + policy gains -> the pose is held the moment the host starts accepting user commands
   last_q_ = st->q; last_dq_.setZero(); last_tau_.setZero(); last_kp_ = hold_kp_; last_kd_ = hold_kd_; have_last_ = true;
-  send_raw(last_q_, last_dq_, last_tau_, last_kp_, last_kd_);
+  send_raw(last_q_, last_dq_, last_tau_, last_kp_, last_kd_, FK_ACQUIRE);
   rf_->active = true;  // L2+B counts from now on
   mode_ = ACQUIRE;  // we are the writer from now on: the streamer keeps sending the acquire frame until confirmed
   start_threads();
@@ -267,9 +335,10 @@ bool ControlSession::acquire(bool fast) {
   return true;
 }
 
-void ControlSession::send_raw(const Vec& q, const Vec& dq, const Vec& tau, const Vec& kp, const Vec& kd) {
+void ControlSession::send_raw(const Vec& q, const Vec& dq, const Vec& tau, const Vec& kp, const Vec& kd, uint8_t kind) {
   link_.send(q, dq, tau, kp, kd);
   n_sent_++;
+  if (kind != FK_POLICY) log_frame(kind, q, kp, kd, link_.last_send_us());  // policy frames are rows of trace.csv
 }
 
 bool ControlSession::write(const Vec& q_t, const Vec& kp, const Vec& kd, double dt) {
@@ -280,13 +349,16 @@ bool ControlSession::write(const Vec& q_t, const Vec& kp, const Vec& kd, double 
   if (!st) { emergency(Fault::COMM_TIMEOUT, "no state when sending"); return false; }
   CmdOut c;
   try {
-    c = guard_.filter_command(q_t, kp, kd, st->q, st->dq, dt, now());
+    c = guard_.filter_command(q_t, kp, kd, st->q, st->dq, dt, now(), &ftr_);
   } catch (const GuardReject& e) {
+    event("cmd_rejected", "\"tick\":" + std::to_string(cur_tick_.load()) + ",\"why\":\"" + json_escape(e.what()) + "\",\"raw_q_target\":[" + [&] { std::string s; for (int i = 0; i < N; i++) { char b[32]; if (std::isfinite(q_t[i])) snprintf(b, sizeof b, "%s%.9g", i ? "," : "", q_t[i]); else snprintf(b, sizeof b, "%snull", i ? "," : ""); s += b; } return s; }() + "]");
     emergency(Fault::CMD_INVALID, e.what());
     return false;
   }
+  log_clip_rows(ftr_, st->q, cur_tick_.load(), PH_RUN, nullptr);
+  last_out_ = c;
   last_q_ = c.q; last_dq_ = c.dq; last_tau_ = c.tau; last_kp_ = c.kp; last_kd_ = c.kd; have_last_ = true;
-  send_raw(c.q, c.dq, c.tau, c.kp, c.kd);
+  send_raw(c.q, c.dq, c.tau, c.kp, c.kd, FK_POLICY);
   return true;
 }
 
@@ -312,6 +384,7 @@ void ControlSession::trigger_exit(Fault f, const std::string& detail, double t_d
       req.precheck = user_fsm_seen_ < 0 || f == Fault::FSM_CHANGED;  // control may never have been taken / may already be back at the OEM
       req.t_detect = t_detect;
       req.t_event = t_event;
+      req.att = x.att;
       exec_.submit(req);  // RPC wake + first HOLD/DAMP frame
       {
         std::lock_guard<std::recursive_mutex> lk(lk_);
@@ -338,13 +411,15 @@ void ControlSession::exit_frame(FrameKind k, const Vec& q_snap) {
   Vec qm = (st && st->q.allFinite()) ? st->q : q_snap;
   if (k == FrameKind::HOLD && st) {
     try {
-      CmdOut c = guard_.filter_command(q_snap, hold_kp_ * cfg_.exit.hold_gain_scale, hold_kd_ * cfg_.exit.hold_gain_scale, st->q, st->dq, 0.01, now());
+      FilterTrace ft;
+      CmdOut c = guard_.filter_command(q_snap, hold_kp_ * cfg_.exit.hold_gain_scale, hold_kd_ * cfg_.exit.hold_gain_scale, st->q, st->dq, 0.01, now(), log_ ? &ft : nullptr, false);
+      if (log_) log_clip_rows(ft, st->q, -1, PH_EXIT, nullptr);
       last_q_ = c.q; have_last_ = true;
-      send_raw(c.q, c.dq, c.tau, c.kp, c.kd);
+      send_raw(c.q, c.dq, c.tau, c.kp, c.kd, FK_HOLD);
       return;
     } catch (const GuardReject&) {}
   }
-  send_raw(qm, Vec::Zero(), Vec::Zero(), Vec::Zero(), Vec::Constant(DAMP_KD));
+  send_raw(qm, Vec::Zero(), Vec::Zero(), Vec::Zero(), Vec::Constant(DAMP_KD), FK_DAMP);
 }
 
 void ControlSession::start_threads() {
@@ -370,8 +445,8 @@ void ControlSession::watch_loop() {
     if (st && st->seq != last_seq) {
       last_seq = st->seq;
       Stability sv = watch_mon_.update(*st);
-      if (sv == Stability::FALLEN) { trigger_exit(Fault::TILT, watch_mon_.detail(), mono(), st->arrival); continue; }
-      if (sv == Stability::UNSTABLE) { trigger_exit(Fault::UNSTABLE, watch_mon_.detail(), mono(), st->arrival); continue; }
+      if (sv == Stability::FALLEN) { trigger_exit(Fault::TILT, watch_mon_.detail(), mono(), st->arrival); event("tilt_judge_trigger", watch_mon_.trigger_json()); continue; }
+      if (sv == Stability::UNSTABLE) { trigger_exit(Fault::UNSTABLE, watch_mon_.detail(), mono(), st->arrival); event("tilt_judge_trigger", watch_mon_.trigger_json()); continue; }
     }
     if (quit_ && !guard_.tripped()) { trigger_exit(Fault::SIGNAL, "signal (SIGINT/SIGTERM)", t_now, 0); continue; }
     if (rf_->fired.load() > 0 && !guard_.tripped()) { trigger_exit(Fault::REMOTE_STOP, "remote controller START double-click", rf_->tm.load(), 0); continue; }
@@ -409,7 +484,7 @@ void ControlSession::stream_loop() {
     if (mode_.load() == ACQUIRE) {
       std::lock_guard<std::recursive_mutex> lk(lk_);
       if (mode_.load() == ACQUIRE && have_last_) {
-        try { send_raw(last_q_, last_dq_, last_tau_, last_kp_, last_kd_); } catch (const std::exception& e) { logf("[session] acquire stream error %s", e.what()); }
+        try { send_raw(last_q_, last_dq_, last_tau_, last_kp_, last_kd_, FK_ACQUIRE); } catch (const std::exception& e) { logf("[session] acquire stream error %s", e.what()); }
       }
     }
     double d = nxt - mono();

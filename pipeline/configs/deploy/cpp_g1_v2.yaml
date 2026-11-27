@@ -1,0 +1,34 @@
+# 部署配置 cpp_g1_v2（V1.5.1 部署热修复；由 cpp_g1_v1 复制而来，v1 保持不变）
+# 与 v1 的区别全部在“框架 + 打包器”里（deploy/partymimic_cpp + pmpipe/package.py），本文件只是把它们登记为一个新的、可追溯的部署配置：
+#   * DDS：不再在 F1+F3 / L1+A 期间创建、销毁临时 DDS reader（CycloneDDS-C++ EntityDelegate::prevent_callbacks() 断言 / SIGABRT rc 134 的根因）；
+#         所有 DDS 实体常驻、绝不销毁；流量判别用常驻监视 reader + 10 s 滚动历史
+#   * 预热 runner：服务启动（及每次运行结束）时就加载模型、推理预热、建立 DDS 监视；F1+F3 只触发实时检查 -> READY（约 3 s -> <1 s）
+#   * start.sh：默认完整舞蹈（dance），无交互式模式菜单；未验证包络授权“一次性现场授权”（绑定包/模式/窗口/主机，默认 24 h），不再每次启动输入
+#   * 打包器：zip 内脚本 0755 + 文件类型位 + 目录条目；解压即可执行；打包后用 unzip / bsdtar / Python 三种方式复核
+#   * 计时：plan_timeline() 单一函数规划 前导冻结 + 整段动作 + 末帧保持；selfcheck 7k 与打包器都核对窗口覆盖最后一帧且不被 runner 保险时限截断
+name: cpp_g1_v2
+description: "V1.5.1：DDS 生命周期修复 + 预热 runner + 默认完整舞蹈 + 一次性现场授权 + 解压即可执行"
+framework: deploy/partymimic_cpp
+package_prefix: partymimic_cpp
+site_overrides: {}
+modes:
+  hold_s: 3.0
+  exit_s: 8.0
+  clip2_s: 2.0
+  clip4_s: 4.0
+admission:
+  require_sim2sim_pass: true
+  require_onnx_parity: true
+  require_eval_gate: true
+  require_cpp_selfcheck: true
+onnx_parity_max_abs: 1.0e-3
+dev_build_check: true
+# 打包规则（V1.5.1）：这些规则不能被命令行关闭
+zip:
+  script_mode: 0o755        # 所有带 #! 的文件 / *.sh / *.so
+  data_mode: 0o644
+  verify_extractors: [unzip, bsdtar, python]   # 解压后逐个脚本检查可执行位（工具不存在则跳过该项）
+timeline:
+  lead_in_s: 1.0            # = 框架 site.conf lead_in_s（打包器按框架文件核对）
+  end_hold_s: 0.5
+  min_failsafe_margin_s: 0.5
